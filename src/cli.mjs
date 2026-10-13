@@ -12,6 +12,7 @@ import { VERSION, integer, readJSON, readText, resolveCLI, sleep, writeJSON } fr
 const options = Object.fromEntries([
   'workspace', 'provider', 'review-provider', 'model', 'review-model', 'effort', 'review-effort',
   'workers', 'permissions', 'max-tasks', 'max-revisions', 'timeout', 'context-chars', 'curator-batch',
+  'max-goal-rounds', 'max-no-progress', 'max-control-failures', 'max-attempts',
   'input-policy',
   'prompt', 'prompt-file', 'file', 'config', 'runs-root', 'codex-bin', 'claude-bin', 'target', 'query',
 ].map(name => [name, { type: 'string' }]));
@@ -53,7 +54,8 @@ start: 초기 프롬프트를 여러 줄로 붙여 넣고 마지막에 /end를 �
        Codex 기본: --model gpt-5.6-sol --effort xhigh (Codex 검토 max)
        Claude 기본: CLI 모델 설정, effort auto
        --model MODEL  --review-model MODEL  --review-effort LEVEL
-       --max-tasks 8  --max-revisions 2  --timeout 1200  --no-interactive  --json
+       --max-tasks 8  --max-revisions 2  --max-goal-rounds 12  --max-no-progress 3
+       --max-control-failures 5  --max-attempts 100  --timeout 1200  --no-interactive  --json
        --max-tasks는 전체 종료 한도가 아니라 한 목표 사이클이 제안할 수 있는 작업 상한입니다.
        --config config.json으로 역할별 provider/model/effort도 지정할 수 있습니다.
 
@@ -74,6 +76,8 @@ function configPatch(base = {}) {
   const patch = { ...base, roleSettings: structuredClone(base.roleSettings || {}) };
   const map = { workspace: 'workspace', provider: 'provider', model: 'model', effort: 'effort', workers: 'workers',
     permissions: 'permissions', 'max-tasks': 'maxTasks', 'max-revisions': 'maxRevisions', timeout: 'timeout',
+    'max-goal-rounds': 'maxGoalRounds', 'max-no-progress': 'maxNoProgress', 'max-control-failures': 'maxControlFailures',
+    'max-attempts': 'maxAttempts',
     'input-policy': 'inputPolicy',
     'context-chars': 'contextCharacters', 'curator-batch': 'curatorBatch', 'codex-bin': 'codexBin', 'claude-bin': 'claudeBin' };
   for (const [option, key] of Object.entries(map)) if (values[option] !== undefined) patch[key] = values[option];
@@ -90,7 +94,11 @@ function summary(store) {
   const tasks = store.tasks();
   const counts = {};
   for (const task of tasks) counts[task.state] = (counts[task.state] || 0) + 1;
-  return { state: store.getMeta('state'), control: store.getMeta('control'), goal: store.getMeta('goal:assessment'), counts,
+  const completion = store.completionStatus();
+  return { format_version: completion.format_version, goal_format_version: completion.goal_format_version,
+    state: completion.execution_state, control: store.getMeta('control'),
+    goal_outcome: completion.goal_outcome, termination: completion.termination, report: completion.report,
+    contract: store.getMeta('goal:contract'), goal: store.getMeta('goal:assessment'), counts,
     facts: store.listFacts({ limit: 500 }).map(({ id, key, state }) => ({ id, key, state })),
     tasks: tasks.map(({ id, title, state, revisions, failures, feedback }) => ({ id, title, state, revisions, failures, feedback })) };
 }
@@ -98,7 +106,9 @@ function showStatus(store) {
   const result = summary(store);
   if (values.json) console.log(JSON.stringify(result, null, 2));
   else {
-    console.log(`상태 ${result.state} / 제어 ${result.control} / 작업 ${JSON.stringify(result.counts)} / 사실 ${result.facts.length}`);
+    console.log(`실행 ${result.state} / 목표 ${result.goal_outcome} / 보고서 ${result.report.state} / 제어 ${result.control}`);
+    if (result.termination) console.log(`종료 이유 ${result.termination.reason}`);
+    console.log(`작업 ${JSON.stringify(result.counts)} / 사실 ${result.facts.length}`);
     for (const task of result.tasks) console.log(`T${task.id} [${task.state}] ${task.title}${task.feedback ? ' · ' + task.feedback.slice(0, 140) : ''}`);
   }
 }
@@ -109,6 +119,10 @@ function showFacts(store, query) {
   if (!facts.length && !values.json) console.log('저장된 사실 없음');
 }
 function renderEvent(event, rl) {
+  if (event.type === 'run.finished') event = { ...event,
+    goal_outcome: event.goal_outcome ?? 'legacy_unknown',
+    termination_reason: event.termination_reason ?? 'legacy_unknown',
+    report: event.report ?? 'legacy_unknown' };
   if (values.json) { console.log(JSON.stringify(event)); return; }
   if (['provider.message', 'provider.item', 'provider.stderr', 'provider.stdout'].includes(event.type)) {
     const text = event.text || JSON.stringify(event.item || {});
@@ -119,7 +133,7 @@ function renderEvent(event, rl) {
   else if (event.type === 'agent.started') console.log(`[${event.role}${event.task ? ':T' + event.task : ''}] ${event.provider}, model=${event.model || 'CLI 기본'}, effort=${event.effort}`);
   else if (event.type === 'goal.waiting_input') console.log(`목표 진행에 외부 입력이 필요합니다: ${event.question}`);
   else if (event.type === 'goal.assessed') console.log(`[goal:${event.round}] ${event.decision}: ${event.reason.slice(0, 300)}`);
-  else if (event.type === 'run.finished') console.log(`목표 달성: ${event.state}\n보고서: ${event.report}`);
+  else if (event.type === 'run.finished') console.log(`실행 종료: ${event.state} / 목표: ${event.goal_outcome} / 이유: ${event.termination_reason}\n보고서: ${event.report}`);
   else console.log(`[${event.type}] ${JSON.stringify(event).slice(0, 420)}`);
   if (rl) rl.prompt(true);
 }
@@ -229,7 +243,9 @@ async function runController(directory, rl, isResume = false) {
       rl.setPrompt('id2a> '); rl.prompt();
     }
     const state = await engine.run();
-    process.exitCode = state === 'completed' ? 0 : state === 'stopped' ? 130 : 2;
+    const completion = engine.store.completionStatus();
+    process.exitCode = state === 'stopped' ? 130
+      : state === 'completed' && completion.goal_outcome === 'achieved' && completion.report.state === 'complete' ? 0 : 2;
   } finally {
     clearInterval(deltaTimer); flush();
     rl?.close();
@@ -259,7 +275,10 @@ async function main() {
     const runs = listRuns(runsRoot, runScope);
     for (const run of runs) {
       const store = new Store(run.directory, { readOnly: true });
-      try { console.log(`${run.id} [${store.getMeta('state')}] ${run.workspace}`); }
+      try {
+        const completion = store.completionStatus();
+        console.log(`${run.id} [${completion.execution_state}/${completion.goal_outcome}] ${run.workspace}`);
+      }
       finally { store.close(); }
     }
     if (!runs.length) {

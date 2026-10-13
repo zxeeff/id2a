@@ -1,10 +1,39 @@
 const text = { type: 'string' };
+export const goalAnchor = Object.freeze({
+  id: 'G0', type: 'outcome',
+  statement: 'The original goal and all applicable later user instructions are fulfilled in full.',
+  source_reference: 'controller goal anchor',
+  verification: 'Compare the actual current result directly with the full effective user request and cite verified evidence that establishes the requested outcome.',
+});
 const array = items => ({ type: 'array', items });
 const object = properties => ({ type: 'object', properties, required: Object.keys(properties), additionalProperties: false });
 const enumeration = values => ({ type: 'string', enum: values });
 export const taskSchema = object({ title: text, brief: text, scope: text });
 export const plannedTaskSchema = object({ ...taskSchema.properties, depends_on: array({ type: 'integer' }) });
+const contractRequirementSchema = object({
+  type: enumeration(['outcome', 'deliverable', 'constraint']),
+  statement: text,
+  source_reference: text,
+  verification: text,
+});
+const requirementEvaluationSchema = object({
+  requirement_id: text,
+  verdict: enumeration(['satisfied', 'unsatisfied', 'unknown']),
+  fact_ids: array({ type: 'integer' }),
+  reason: text,
+});
 export const schemas = {
+  contract: object({ objective: text, requirements: array(contractRequirementSchema) }),
+  contract_review: object({
+    decision: enumeration(['accept', 'revise']),
+    reason: text,
+    requirement_reviews: array(object({
+      requirement_id: text,
+      verdict: enumeration(['covered', 'weakened', 'unsupported']),
+      reason: text,
+    })),
+    missing_requirements: array(object({ statement: text, source_reference: text, reason: text })),
+  }),
   planner: object({ summary: text, tasks: array(plannedTaskSchema) }),
   worker: object({
     summary: text,
@@ -17,12 +46,23 @@ export const schemas = {
     fact_verdicts: array(object({ id: { type: 'integer' }, state: enumeration(['verified', 'refuted', 'unresolved', 'superseded']), reason: text })) }),
   triage: object({ decision: enumeration(['approve', 'reject']), reason: text }),
   goal: object({
-    decision: enumeration(['complete', 'continue', 'needs_input']),
+    decision: enumeration(['achieved', 'continue', 'needs_input']),
+    contract_revision: { type: 'integer' },
+    requirement_evaluations: array(requirementEvaluationSchema),
     reason: text,
     progress: text,
-    fact_ids: array({ type: 'integer' }),
     next_tasks: array(plannedTaskSchema),
     question: text,
+  }),
+  goal_review: object({
+    decision: enumeration(['accept', 'reject']),
+    contract_revision: { type: 'integer' },
+    reason: text,
+    requirement_reviews: array(object({
+      requirement_id: text,
+      verdict: enumeration(['accept', 'reject']),
+      reason: text,
+    })),
   }),
   curator: object({ scope: text, summary: text, fact_ids: array({ type: 'integer' }) }),
   editor: object({ title: text, body: text, fact_ids: array({ type: 'integer' }) }),

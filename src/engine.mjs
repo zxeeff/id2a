@@ -3,13 +3,21 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { Store } from './store.mjs';
-import { schemas, validate } from './schemas.mjs';
+import { goalAnchor, schemas, validate } from './schemas.mjs';
 import { makePrompt } from './prompts.mjs';
 import { providerFor } from './providers.mjs';
 import { acquireLock, boundedJSON, hash, integer, now, readJSON, readText, sleep, sourceIdentity, writeJSON } from './util.mjs';
 
 export const defaultRunsRoot = fileURLToPath(new URL('../runs/', import.meta.url));
-export const roles = ['planner', 'worker', 'supervisor', 'triage', 'goal', 'curator', 'editor'];
+export const roles = ['contract', 'contract_review', 'planner', 'worker', 'supervisor', 'triage', 'goal', 'goal_review', 'curator', 'editor'];
+
+class AttemptBudgetError extends Error {
+  constructor(limit) {
+    super(`provider 호출 누적 상한(${limit})에 도달했습니다.`);
+    this.name = 'AttemptBudgetError';
+    this.code = 'ID2A_ATTEMPT_BUDGET';
+  }
+}
 
 function workspaceKey(workspace) {
   let resolved = path.resolve(workspace);
@@ -44,7 +52,8 @@ export function configuration(input = {}) {
     workspace: path.resolve(input.workspace || process.cwd()), provider, workers: 2,
     permissions: 'yolo', inputPolicy: 'continue', effort: provider === 'codex' ? 'xhigh' : 'auto',
     model: provider === 'codex' ? 'gpt-5.6-sol' : null, maxTasks: 8, maxRevisions: 2,
-    maxFailures: 2, contextCharacters: 12000, curatorBatch: 4, timeout: 1200,
+    maxFailures: 2, maxControlFailures: 5, maxGoalRounds: 12, maxNoProgress: 3, maxAttempts: 100,
+    contextCharacters: 12000, curatorBatch: 4, timeout: 1200,
     roleSettings: {}, ...input,
   };
   config.workspace = fs.realpathSync(config.workspace);
@@ -54,7 +63,7 @@ export function configuration(input = {}) {
   if (!['continue', 'wait'].includes(config.inputPolicy)) throw new Error('inputPolicy는 continue 또는 wait입니다.');
   const levels = ['auto', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
   if (!levels.includes(config.effort)) throw new Error('잘못된 effort');
-  for (const [label, min, max] of [['workers', 1, 32], ['maxTasks', 1, 32], ['maxRevisions', 0, 20], ['maxFailures', 1, 10], ['contextCharacters', 2000, 100000], ['curatorBatch', 1, 100], ['timeout', 5, 86400]]) {
+  for (const [label, min, max] of [['workers', 1, 32], ['maxTasks', 1, 32], ['maxRevisions', 0, 20], ['maxFailures', 1, 10], ['maxControlFailures', 1, 20], ['maxGoalRounds', 1, 1000], ['maxNoProgress', 1, 100], ['maxAttempts', 3, 100000], ['contextCharacters', 2000, 100000], ['curatorBatch', 1, 100], ['timeout', 5, 86400]]) {
     config[label] = integer(config[label], label, min, max);
   }
   for (const [role, settings] of Object.entries(config.roleSettings)) {
@@ -84,12 +93,16 @@ export function createRun(input, goal, root = defaultRunsRoot) {
   const directory = path.resolve(root, id);
   fs.mkdirSync(directory, { recursive: true });
   fs.writeFileSync(path.join(directory, 'prompt.txt'), goal, 'utf8');
-  writeJSON(path.join(directory, 'run.json'), { id, version: 2, created: now(), source: sourceIdentity(config.workspace), config });
+  writeJSON(path.join(directory, 'run.json'), { id, version: 3, created: now(), source: sourceIdentity(config.workspace), config });
   const store = new Store(directory);
   try {
     store.setMeta('state', 'created');
     store.setMeta('control', 'running');
     store.setMeta('config', config);
+    store.setMeta('goal:format_version', 1);
+    store.setMeta('goal:outcome', 'pending');
+    store.setMeta('run:termination', null);
+    store.setMeta('report:status', { state: 'not_started' });
     store.event('run.created', { run: id, workspace: config.workspace });
   } finally { store.close(); }
   return directory;
@@ -127,7 +140,8 @@ export class Engine {
     this.polling = false;
   }
   settings(role) {
-    const overrides = this.config.roleSettings[role] || {};
+    const inheritedRole = ['contract_review', 'goal_review'].includes(role) ? 'supervisor' : role === 'contract' ? 'planner' : role;
+    const overrides = { ...(this.config.roleSettings[inheritedRole] || {}), ...(this.config.roleSettings[role] || {}) };
     const provider = overrides.provider || this.config.provider;
     return { provider,
       model: provider === this.config.provider ? this.config.model : null,
@@ -163,19 +177,28 @@ export class Engine {
   async runAgent(role, task, data = {}) {
     const settings = this.settings(role);
     const taskID = task?.id || null;
+    // One call from the total persistent budget is reserved for final editing.
+    // A failed editor falls back to a controller report without another call.
+    const attempts = this.store.attemptCount();
+    const limit = role === 'editor' ? this.config.maxAttempts : this.config.maxAttempts - 1;
+    if (attempts >= limit) {
+      throw new AttemptBudgetError(this.config.maxAttempts);
+    }
     const attempt = this.store.beginAttempt(taskID, role, settings.provider);
     const taskDirectory = path.join(this.directory, 'tasks', taskID ? 'T' + taskID : role);
     const attemptDirectory = path.join(this.directory, 'attempts', String(attempt));
     fs.mkdirSync(taskDirectory, { recursive: true });
     fs.mkdirSync(attemptDirectory, { recursive: true });
     const instructions = this.store.messages(taskID);
+    const contract = ['planner', 'worker', 'triage', 'goal', 'goal_review', 'editor'].includes(role)
+      ? this.store.getMeta('goal:contract') : null;
     const promptTask = task?.result ? { ...task, result: {
       summary: task.result.summary, fact_ids: task.result.fact_ids,
       artifacts: (task.result.artifacts || []).map(artifact => ({ path: path.join(taskDirectory, 'outputs', artifact.path), bytes: Buffer.byteLength(artifact.content), sha256: hash(artifact.content) })),
     } } : task;
     const prompt = makePrompt(role, {
       goal: this.goal, task: promptTask, workspace: this.config.workspace, directory: taskDirectory,
-      instructions, maxTasks: this.config.maxTasks, inputPolicy: this.config.inputPolicy, ...data,
+      contract, instructions, maxTasks: this.config.maxTasks, inputPolicy: this.config.inputPolicy, ...data,
     });
     fs.writeFileSync(path.join(attemptDirectory, 'prompt.txt'), prompt, 'utf8');
     writeJSON(path.join(attemptDirectory, 'schema.json'), schemas[role]);
@@ -218,6 +241,118 @@ export class Engine {
         if (JSON.stringify(previous) !== JSON.stringify(current)) this.store.event('workspace.changed', { task: taskID, previous, current });
       }
     }
+  }
+  goalSource() {
+    const instructions = this.store.messages(null).map(message => ({ id: message.id, text: message.text, sha256: hash(message.text) }));
+    const messageCutoff = instructions.at(-1)?.id || 0;
+    const identity = { goal_sha256: hash(this.goal), instructions: instructions.map(({ id, sha256 }) => ({ id, sha256 })), message_cutoff: messageCutoff };
+    return { ...identity, fingerprint: hash(JSON.stringify(identity)), effective_text: [this.goal, ...instructions.map(item => item.text)].join('\n') };
+  }
+  prepareContract(result, revision, source) {
+    if (!result.objective.trim() || result.objective.length > 4000) throw new Error('목표 계약의 objective 형식 오류');
+    if (!result.requirements.length || result.requirements.length > 32) throw new Error('목표 계약에는 1..32개의 필수 조건이 필요합니다.');
+    const sourceText = source.effective_text.normalize('NFKC').replace(/\s+/gu, ' ').trim();
+    const seen = new Set();
+    const extracted = result.requirements.map((requirement, index) => {
+      const statement = requirement.statement.trim();
+      const sourceReference = requirement.source_reference.trim();
+      const verification = requirement.verification.trim();
+      if (!statement || !sourceReference || !verification || statement.length > 3000 || sourceReference.length > 1000 || verification.length > 3000) throw new Error('목표 계약 조건의 필수 문자열 또는 길이 오류');
+      if (!sourceText.includes(sourceReference.normalize('NFKC').replace(/\s+/gu, ' ').trim())) throw new Error(`목표 계약 R${index + 1}의 source_reference가 사용자 지시의 정확한 인용이 아닙니다.`);
+      const identity = hash(`${requirement.type}\n${statement.normalize('NFKC').replace(/\s+/gu, ' ').toLowerCase()}`);
+      if (seen.has(identity)) throw new Error('목표 계약에 중복 조건이 있습니다.');
+      seen.add(identity);
+      return { id: `R${index + 1}`, type: requirement.type, statement, source_reference: sourceReference, verification };
+    });
+    const requirements = [{ ...goalAnchor }, ...extracted];
+    return {
+      format_version: 1, revision, objective: result.objective.trim(), requirements,
+      source: { goal_sha256: source.goal_sha256, instructions: source.instructions, message_cutoff: source.message_cutoff, fingerprint: source.fingerprint },
+      created_at: now(),
+    };
+  }
+  validateStoredContract(contract, source = this.goalSource()) {
+    if (!contract || contract.format_version !== 1 || !Number.isSafeInteger(contract.revision) || contract.revision < 1
+        || !contract.objective?.trim() || !Array.isArray(contract.requirements) || contract.requirements.length < 2
+        || contract.source?.fingerprint !== source.fingerprint || contract.source?.goal_sha256 !== source.goal_sha256) {
+      throw new Error('저장된 목표 계약의 형식 또는 원문 연결이 유효하지 않습니다.');
+    }
+    const expectedIDs = ['G0', ...contract.requirements.slice(1).map((_, index) => `R${index + 1}`)];
+    const actualIDs = contract.requirements.map(item => item.id);
+    const sourceText = source.effective_text.normalize('NFKC').replace(/\s+/gu, ' ').trim();
+    if (new Set(actualIDs).size !== actualIDs.length || JSON.stringify(actualIDs) !== JSON.stringify(expectedIDs)
+        || contract.requirements.some(item => !['outcome', 'deliverable', 'constraint'].includes(item.type)
+          || !item.statement?.trim() || !item.source_reference?.trim() || !item.verification?.trim())
+        || Object.entries(goalAnchor).some(([key, value]) => contract.requirements[0][key] !== value)
+        || contract.requirements.slice(1).some(item => !sourceText.includes(item.source_reference.normalize('NFKC').replace(/\s+/gu, ' ').trim()))) {
+      throw new Error('저장된 목표 계약의 필수 조건 집합이 유효하지 않습니다.');
+    }
+    const review = contract.review;
+    const reviewed = Array.isArray(review?.requirement_reviews) ? review.requirement_reviews.map(item => item.requirement_id) : [];
+    if (review?.decision !== 'accept' || !Array.isArray(review.missing_requirements) || !Array.isArray(review.requirement_reviews)
+        || review.missing_requirements.length
+        || new Set(reviewed).size !== reviewed.length || reviewed.length !== expectedIDs.length || reviewed.some(id => !expectedIDs.includes(id))
+        || review.requirement_reviews.some(item => item.verdict !== 'covered')) {
+      throw new Error('저장된 목표 계약에 유효한 독립 검토가 없습니다.');
+    }
+    return contract;
+  }
+  validateContractReview(contract, review) {
+    const expected = contract.requirements.map(item => item.id);
+    const actual = review.requirement_reviews.map(item => item.requirement_id);
+    if (new Set(actual).size !== actual.length || actual.length !== expected.length || actual.some(id => !expected.includes(id))) {
+      throw new Error('계약 검토는 모든 조건 ID를 정확히 한 번 평가해야 합니다.');
+    }
+    if (review.decision === 'accept' && (review.missing_requirements.length || review.requirement_reviews.some(item => item.verdict !== 'covered'))) {
+      throw new Error('누락·약화·근거 없는 조건이 있는 계약은 승인할 수 없습니다.');
+    }
+  }
+  async ensureGoalContract() {
+    let source = this.goalSource();
+    const current = this.store.getMeta('goal:contract');
+    if (current?.source?.fingerprint === source.fingerprint) {
+      try { return this.validateStoredContract(current, source); }
+      catch (error) { this.store.event('goal.contract_invalid', { revision: current?.revision, reason: error.message }); }
+    }
+    const revision = (Number.isSafeInteger(current?.revision) ? current.revision : 0) + 1;
+    let feedback = current ? 'Later user instructions changed the effective request. Preserve unchanged requirements and apply the new instruction without weakening the goal.' : '';
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const { result } = await this.runAgent('contract', null, {
+        context: { proposed_revision: revision, previous_contract: current, controller_feedback: feedback },
+        feedback,
+      });
+      if (this.goalSource().fingerprint !== source.fingerprint) { source = this.goalSource(); feedback = 'The user instructions changed while the contract was being prepared. Rebuild it from the current effective request.'; continue; }
+      const candidate = this.prepareContract(result, revision, source);
+      const { result: review } = await this.runAgent('contract_review', null, {
+        candidate,
+        context: { proposed_revision: revision, previous_contract: current },
+      });
+      this.validateContractReview(candidate, review);
+      if (this.goalSource().fingerprint !== source.fingerprint) { source = this.goalSource(); feedback = 'The user instructions changed during contract review. Rebuild it from the current effective request.'; continue; }
+      if (review.decision === 'revise') { feedback = JSON.stringify(review); continue; }
+      const stored = { ...candidate, review: { ...review, at: now() } };
+      const committed = this.store.transaction(() => {
+        const cutoff = Number(this.store.db.prepare("SELECT COALESCE(MAX(id),0) AS id FROM messages WHERE target='all'").get().id);
+        if (cutoff !== source.message_cutoff) return false;
+        if (Number.isSafeInteger(current?.revision)) this.store.setMeta(`goal:contract:${current.revision}`, current);
+        const previousAssessment = this.store.getMeta('goal:assessment');
+        const previousProgress = this.store.getMeta('goal:progress');
+        if (current?.revision && previousAssessment) this.store.setMeta(`goal:assessment:${current.revision}`, previousAssessment);
+        if (current?.revision && previousProgress) this.store.setMeta(`goal:progress:${current.revision}`, previousProgress);
+        this.store.setMeta('goal:contract', stored);
+        this.store.setMeta('goal:format_version', 1);
+        this.store.setMeta('goal:outcome', 'pending');
+        this.store.setMeta('goal:assessment', null);
+        this.store.setMeta('goal:progress', null);
+        this.store.setMeta('run:termination', null);
+        this.store.setMeta('report:status', { state: current ? 'stale' : 'not_started', contract_revision: revision });
+        return true;
+      });
+      if (!committed) { source = this.goalSource(); feedback = 'The user instructions changed before the contract was stored. Rebuild it.'; continue; }
+      this.store.event('goal.contract_created', { revision, requirements: stored.requirements.map(item => item.id), source_fingerprint: source.fingerprint });
+      return stored;
+    }
+    throw new Error('현재 사용자 지시와 일치하는 목표 계약을 확정하지 못했습니다.');
   }
   async plan() {
     if (this.store.getMeta('planned')) return;
@@ -278,6 +413,9 @@ export class Engine {
       const task = this.store.task(id);
       if (this.abortController.signal.aborted) {
         this.store.updateTask(id, { state: task.result ? 'reviewing' : 'queued', feedback: task.feedback });
+      } else if (error.code === 'ID2A_ATTEMPT_BUDGET') {
+        this.store.updateTask(id, { state: task.result ? 'reviewing' : 'queued', feedback: error.message });
+        this.store.event('task.deferred', { task: id, reason: 'attempt_budget', detail: error.message });
       } else {
         const failures = task.failures + 1;
         this.store.updateTask(id, { state: failures >= this.config.maxFailures ? 'stalled' : task.result ? 'reviewing' : 'queued', failures, feedback: error.message });
@@ -351,17 +489,21 @@ export class Engine {
     const { tasks, snapshot } = view;
     const verified = view.facts.filter(fact => fact.state === 'verified');
     const conflicted = view.facts.filter(fact => fact.state === 'conflicted');
+    const evidence = this.store.evidenceStatus(view);
     const budget = Math.floor(this.config.contextCharacters * 0.4);
     const ordered = tasks.toReversed().sort((a, b) => Number(a.state === 'accepted') - Number(b.state === 'accepted'));
     const { items: compactTasks, ...taskCoverage } = boundedJSON(ordered.map(task => this.store.taskRecord(task)), budget);
     compactTasks.sort((a, b) => a.id - b.id);
-    const { items: compactFacts, ...factCoverage } = boundedJSON(verified.toReversed().map(({ id, key, scope, kind, claim }) => ({ id, key, scope, kind, claim })), budget);
+    const { items: compactFacts, ...factCoverage } = boundedJSON(verified.toReversed().map(({ id, key, scope, kind, claim }) => ({ id, key, scope, kind, claim,
+      current_evidence: evidence.facts[id] === true })), budget);
     compactFacts.reverse();
     const knowledge = this.store.knowledgeContext(view, this.config.contextCharacters - budget * 2);
-    const coverage = { ...knowledge.coverage, tasks: taskCoverage, facts: { ...factCoverage, state: 'verified' } };
+    const coverage = { ...knowledge.coverage, tasks: taskCoverage, facts: { ...factCoverage, state: 'verified',
+      current_evidence: Object.values(evidence.facts).filter(Boolean).length } };
     const counts = {};
     for (const task of tasks) counts[task.state] = (counts[task.state] || 0) + 1;
-    return { tasks, verified, conflicted, compactTasks, compactFacts, counts, knowledge, coverage, snapshot };
+    return { tasks, verified, conflicted, compactTasks, compactFacts, counts, knowledge, coverage, snapshot,
+      evidenceSnapshot: evidence.snapshot, currentFactIDs: new Set(Object.entries(evidence.facts).filter(([, current]) => current).map(([id]) => Number(id))) };
   }
   queueGoalTasks(candidates, round, reason) {
     const scheduled = [];
@@ -395,11 +537,262 @@ export class Engine {
     }
     return scheduled;
   }
+  messageCutoff() {
+    return Number(this.store.db.prepare('SELECT COALESCE(MAX(id),0) AS id FROM messages').get().id);
+  }
+  completionCandidate(view, contract) {
+    return {
+      ledger_snapshot: view.snapshot,
+      evidence_snapshot: view.evidenceSnapshot,
+      message_cutoff: this.messageCutoff(),
+      contract_hash: hash(JSON.stringify(contract)),
+      contract_revision: contract.revision,
+    };
+  }
+  candidateIsCurrent(candidate) {
+    const contract = this.store.getMeta('goal:contract');
+    const view = this.store.ledgerView();
+    return this.store.getMeta('control') === 'running'
+      && view.snapshot === candidate.ledger_snapshot
+      && this.store.evidenceStatus(view).snapshot === candidate.evidence_snapshot
+      && this.messageCutoff() === candidate.message_cutoff
+      && hash(JSON.stringify(contract)) === candidate.contract_hash;
+  }
+  attemptBudgetExhausted() {
+    return this.store.attemptCount() >= this.config.maxAttempts - 1;
+  }
+  reusableTerminalOutcome(status) {
+    if (status.execution_state !== 'completed' || !['achieved', 'not_established'].includes(status.goal_outcome)) return null;
+    const savedCandidate = this.store.getMeta('goal:candidate');
+    const assessment = this.store.getMeta('goal:assessment');
+    if (!savedCandidate || !assessment) return null;
+    try {
+      const contract = this.validateStoredContract(this.store.getMeta('goal:contract'), this.goalSource());
+      const view = this.goalContext();
+      const candidate = this.completionCandidate(view, contract);
+      if (JSON.stringify(candidate) !== JSON.stringify(savedCandidate)) return null;
+      const expected = contract.requirements.map(item => item.id);
+      const evaluated = assessment.requirement_evaluations?.map(item => item.requirement_id) || [];
+      if (assessment.contract_revision !== contract.revision || new Set(evaluated).size !== evaluated.length
+          || evaluated.length !== expected.length || evaluated.some(id => !expected.includes(id))) return null;
+      if (status.goal_outcome === 'achieved') {
+        this.validateGoalAssessment(assessment, contract, view);
+        this.validateGoalReview(assessment.independent_review, contract);
+        return { kind: 'achieved', assessment, candidate };
+      }
+      if (assessment.decision !== 'concluded' || !['budget_exhausted', 'no_progress', 'external_blocker'].includes(status.termination?.reason)) return null;
+      return { kind: 'concluded', assessment, candidate, terminationReason: status.termination.reason };
+    } catch { return null; }
+  }
+  pendingTerminalOutcome() {
+    const pending = this.store.getMeta('goal:pending_terminal');
+    if (!pending || !['achieved', 'concluded'].includes(pending.kind) || !pending.assessment || !pending.candidate) return null;
+    try {
+      const contract = this.validateStoredContract(this.store.getMeta('goal:contract'), this.goalSource());
+      const view = this.goalContext();
+      const candidate = this.completionCandidate(view, contract);
+      if (JSON.stringify(candidate) !== JSON.stringify(pending.candidate)) return null;
+      const expected = contract.requirements.map(item => item.id);
+      const evaluated = pending.assessment.requirement_evaluations?.map(item => item.requirement_id) || [];
+      if (pending.assessment.contract_revision !== contract.revision || new Set(evaluated).size !== evaluated.length
+          || evaluated.length !== expected.length || evaluated.some(id => !expected.includes(id))) return null;
+      if (pending.kind === 'achieved') {
+        this.validateGoalAssessment(pending.assessment, contract, view);
+        this.validateGoalReview(pending.assessment.independent_review, contract);
+      } else if (pending.assessment.decision !== 'concluded'
+          || !['budget_exhausted', 'no_progress', 'external_blocker'].includes(pending.terminationReason)) return null;
+      return pending;
+    } catch { return null; }
+  }
+  terminalLimitStillApplies(outcome) {
+    if (outcome.kind === 'achieved') return true;
+    if (outcome.terminationReason === 'budget_exhausted') {
+      return this.store.getMeta('goal:round', 0) >= this.config.maxGoalRounds || this.attemptBudgetExhausted();
+    }
+    if (outcome.terminationReason === 'no_progress') {
+      return (this.store.getMeta('goal:progress')?.stagnant || 0) >= this.config.maxNoProgress;
+    }
+    return true;
+  }
+  completedReportIsCurrent(status) {
+    if (status.report?.state !== 'complete' || !status.report.id) return false;
+    const reportPath = status.report.path || path.join(this.directory, 'report.md');
+    const resultPath = path.join(this.directory, 'result.json');
+    try {
+      const result = readJSON(resultPath);
+      return fs.statSync(reportPath).isFile() && result.report?.state === 'complete'
+        && result.report.id === status.report.id && result.goal_outcome === status.goal_outcome;
+    } catch { return false; }
+  }
+  controlFailureState(stage) {
+    const value = this.store.getMeta(`control:failures:${stage}`, { count: 0 });
+    return typeof value === 'number' ? { count: value } : value;
+  }
+  controlFailureContext(stage) {
+    const roleMap = {
+      contract: ['contract', 'contract_review'],
+      plan: ['planner'],
+      goal: ['contract', 'contract_review', 'goal', 'goal_review'],
+    };
+    return hash(JSON.stringify({
+      source: this.goalSource().fingerprint,
+      roles: (roleMap[stage] || []).map(role => [role, this.settings(role)]),
+      timeout: this.config.timeout,
+      permissions: this.config.permissions,
+      inputPolicy: this.config.inputPolicy,
+      codexBin: this.config.codexBin || null,
+      claudeBin: this.config.claudeBin || null,
+    }));
+  }
+  assertControlBudget(stage) {
+    const state = this.controlFailureState(stage);
+    const sourceFingerprint = this.goalSource().fingerprint;
+    const contextFingerprint = this.controlFailureContext(stage);
+    if ((state.context_fingerprint && state.context_fingerprint !== contextFingerprint)
+        || (!state.context_fingerprint && state.source_fingerprint && state.source_fingerprint !== sourceFingerprint)) {
+      this.store.setMeta(`control:failures:${stage}`, { count: 0, source_fingerprint: sourceFingerprint,
+        context_fingerprint: contextFingerprint, reset_at: now() });
+      return;
+    }
+    if ((state.count || 0) >= this.config.maxControlFailures) {
+      throw new Error(`${stage} 제어 단계의 누적 실패 상한(${this.config.maxControlFailures})에 도달했습니다.`);
+    }
+  }
+  recordControlFailure(stage, error) {
+    const previous = this.controlFailureState(stage);
+    const sourceFingerprint = this.goalSource().fingerprint;
+    const contextFingerprint = this.controlFailureContext(stage);
+    const sameContext = previous.context_fingerprint
+      ? previous.context_fingerprint === contextFingerprint
+      : !previous.source_fingerprint || previous.source_fingerprint === sourceFingerprint;
+    const state = { count: sameContext ? (previous.count || 0) + 1 : 1, source_fingerprint: sourceFingerprint,
+      context_fingerprint: contextFingerprint, reason: error.message, at: now() };
+    this.store.setMeta(`control:failures:${stage}`, state);
+    return state.count;
+  }
+  resetControlFailures(stage) {
+    this.store.setMeta(`control:failures:${stage}`, { count: 0, source_fingerprint: this.goalSource().fingerprint,
+      context_fingerprint: this.controlFailureContext(stage), reset_at: now() });
+  }
+  attemptBudgetConclusion() {
+    const contract = this.validateStoredContract(this.store.getMeta('goal:contract'), this.goalSource());
+    const view = this.goalContext();
+    const round = this.store.getMeta('goal:round', 0);
+    const reason = `provider 호출 누적 상한(${this.config.maxAttempts})에 도달하여 목표 달성을 입증하지 못했습니다.`;
+    const assessment = {
+      decision: 'concluded', proposed_decision: 'continue', outcome: 'not_established', termination_reason: 'budget_exhausted',
+      contract_revision: contract.revision,
+      requirement_evaluations: contract.requirements.map(requirement => ({ requirement_id: requirement.id,
+        verdict: 'unknown', fact_ids: [], reason: '호출 예산 안에서 이 조건의 충족을 현재 근거로 입증하지 못했습니다.' })),
+      reason, progress: '기록된 작업과 근거는 보존됐으며, 추가 실행에는 호출 예산을 늘려야 합니다.',
+      next_tasks: [], question: '', fact_ids: [], round, at: now(), concluded_at: now(),
+    };
+    const candidate = this.completionCandidate(view, contract);
+    this.store.setMeta('goal:assessment', assessment);
+    this.store.event('goal.concluded', { round, reason: 'budget_exhausted', detail: reason,
+      attempts: this.store.attemptCount(), limit: this.config.maxAttempts });
+    return { kind: 'concluded', assessment, terminationReason: 'budget_exhausted', candidate };
+  }
+  goalRoundBudgetConclusion() {
+    const contract = this.validateStoredContract(this.store.getMeta('goal:contract'), this.goalSource());
+    const view = this.goalContext();
+    const round = this.store.getMeta('goal:round', 0);
+    const reason = `Goal 판정 누적 상한(${this.config.maxGoalRounds})에 도달하여 목표 달성을 추가로 판정하지 않았습니다.`;
+    const assessment = {
+      decision: 'concluded', proposed_decision: 'continue', outcome: 'not_established', termination_reason: 'budget_exhausted',
+      contract_revision: contract.revision,
+      requirement_evaluations: contract.requirements.map(requirement => ({ requirement_id: requirement.id,
+        verdict: 'unknown', fact_ids: [], reason: '판정 예산 안에서 이 조건의 충족을 현재 근거로 확정하지 못했습니다.' })),
+      reason, progress: '기록된 작업과 근거는 보존됐으며, 추가 판정에는 Goal 판정 한도를 늘려야 합니다.',
+      next_tasks: [], question: '', fact_ids: [], round, at: now(), concluded_at: now(),
+    };
+    const candidate = this.completionCandidate(view, contract);
+    this.store.setMeta('goal:assessment', assessment);
+    this.store.event('goal.concluded', { round, reason: 'budget_exhausted', detail: reason,
+      rounds: round, limit: this.config.maxGoalRounds });
+    return { kind: 'concluded', assessment, terminationReason: 'budget_exhausted', candidate };
+  }
+  validateGoalAssessment(result, contract, view) {
+    if (result.contract_revision !== contract.revision) throw new Error('목표 판정의 계약 revision이 현재 계약과 다릅니다.');
+    const expected = contract.requirements.map(item => item.id);
+    const actual = result.requirement_evaluations.map(item => item.requirement_id);
+    if (new Set(actual).size !== actual.length || actual.length !== expected.length || actual.some(id => !expected.includes(id))) {
+      throw new Error('목표 판정은 모든 필수 조건 ID를 정확히 한 번 평가해야 합니다.');
+    }
+    const verifiedIDs = new Set(view.verified.map(fact => fact.id));
+    for (const evaluation of result.requirement_evaluations) {
+      if (!evaluation.reason.trim()) throw new Error(`${evaluation.requirement_id}: 판정 이유가 비어 있습니다.`);
+      if (new Set(evaluation.fact_ids).size !== evaluation.fact_ids.length || evaluation.fact_ids.some(id => !verifiedIDs.has(id))) {
+        throw new Error(`${evaluation.requirement_id}: 현재 검증되지 않은 사실을 인용했습니다.`);
+      }
+      if (evaluation.fact_ids.some(id => !view.currentFactIDs.has(id))) throw new Error(`${evaluation.requirement_id}: 현재 원본과 일치하지 않는 오래된 사실을 인용했습니다.`);
+      if (evaluation.verdict === 'satisfied' && !evaluation.fact_ids.length) throw new Error(`${evaluation.requirement_id}: 충족 판정에는 현재 검증 근거가 필요합니다.`);
+    }
+    if (result.next_tasks.length > this.config.maxTasks) throw new Error('목표 판정의 다음 작업 수가 사이클 상한을 초과했습니다.');
+    const allSatisfied = result.requirement_evaluations.every(item => item.verdict === 'satisfied');
+    if (result.decision === 'achieved' && (!allSatisfied || result.next_tasks.length || result.question.trim())) throw new Error('달성 판정에는 모든 필수 조건의 충족, 빈 다음 작업, 빈 질문이 필요합니다.');
+    if (result.decision === 'continue' && (allSatisfied || !result.next_tasks.length || result.question.trim())) throw new Error('계속 판정에는 미충족 조건, 하나 이상의 다음 작업, 빈 질문이 필요합니다.');
+    if (result.decision === 'needs_input' && (allSatisfied || result.next_tasks.length || !result.question.trim())) throw new Error('입력 대기 판정에는 미충족 조건과 다음 작업 없는 정확한 질문이 필요합니다.');
+    if (result.decision === 'achieved' && view.conflicted.length) throw new Error('해결되지 않은 사실 충돌이 있으면 목표 달성을 승인할 수 없습니다.');
+  }
+  validateGoalReview(review, contract) {
+    if (review.contract_revision !== contract.revision) throw new Error('독립 완료 검토의 계약 revision이 현재 계약과 다릅니다.');
+    const expected = contract.requirements.map(item => item.id);
+    const actual = review.requirement_reviews.map(item => item.requirement_id);
+    if (new Set(actual).size !== actual.length || actual.length !== expected.length || actual.some(id => !expected.includes(id))) {
+      throw new Error('독립 완료 검토는 모든 필수 조건 ID를 정확히 한 번 평가해야 합니다.');
+    }
+    if (review.decision === 'accept' && review.requirement_reviews.some(item => item.verdict !== 'accept')) throw new Error('거절된 조건이 있는 완료 후보는 승인할 수 없습니다.');
+    if (review.decision === 'reject' && review.requirement_reviews.every(item => item.verdict === 'accept')) throw new Error('완료 후보 거절에는 하나 이상의 거절된 조건이 필요합니다.');
+  }
+  progressState(assessment) {
+    const current = assessment.requirement_evaluations
+      .map(item => [item.requirement_id, item.verdict, [...item.fact_ids].sort((a, b) => a - b)])
+      .sort((left, right) => left[0].localeCompare(right[0]));
+    const signature = hash(JSON.stringify(current));
+    const previous = this.store.getMeta('goal:progress');
+    const previousSeen = previous?.seen && typeof previous.seen === 'object' ? previous.seen : {};
+    const currentByID = new Map(current.map(item => [item[0], item]));
+    const seen = {};
+    let progressed = false;
+    for (const requirementID of [...new Set([...Object.keys(previousSeen), ...currentByID.keys()])].sort()) {
+      const prior = previousSeen[requirementID] || {};
+      const verdicts = new Set(Array.isArray(prior.verdicts) ? prior.verdicts : []);
+      const factIDs = new Set(Array.isArray(prior.fact_ids) ? prior.fact_ids : []);
+      const evaluation = currentByID.get(requirementID);
+      if (evaluation) {
+        if (!verdicts.has(evaluation[1])) progressed = true;
+        verdicts.add(evaluation[1]);
+        for (const factID of evaluation[2]) {
+          if (!factIDs.has(factID)) progressed = true;
+          factIDs.add(factID);
+        }
+      }
+      seen[requirementID] = {
+        verdicts: [...verdicts].sort(),
+        fact_ids: [...factIDs].sort((a, b) => a - b),
+      };
+    }
+    const priorStagnant = Number.isSafeInteger(previous?.stagnant) && previous.stagnant >= 0 ? previous.stagnant : 0;
+    const stagnant = progressed ? 0 : priorStagnant + 1;
+    const state = { signature, seen, progressed, stagnant, round: assessment.round, at: now() };
+    this.store.setMeta('goal:progress', state);
+    return state;
+  }
+  concludeAssessment(assessment, terminationReason, candidate) {
+    const concluded = { ...assessment, proposed_decision: assessment.decision, decision: 'concluded',
+      outcome: 'not_established', termination_reason: terminationReason, concluded_at: now() };
+    this.store.setMeta('goal:assessment', concluded);
+    this.store.event('goal.concluded', { round: assessment.round, reason: terminationReason, detail: assessment.reason });
+    return { kind: 'concluded', assessment: concluded, terminationReason, candidate };
+  }
   async assessGoal() {
-    const beforeTasks = JSON.stringify(this.store.tasks().map(task => [task.id, task.state, task.revisions, task.failures]));
-    const beforeMessage = this.store.messages(null).at(-1)?.id || 0;
+    const contract = this.store.getMeta('goal:contract');
+    if (!contract) throw new Error('목표 계약이 없습니다.');
+    const beforeMessage = this.messageCutoff();
     const round = this.store.getMeta('goal:round', 0) + 1;
     const view = this.goalContext();
+    const candidate = this.completionCandidate(view, contract);
     const { result } = await this.runAgent('goal', null, {
       facts: view.compactFacts,
       context: {
@@ -414,36 +807,60 @@ export class Engine {
         current_source: sourceIdentity(this.config.workspace),
       },
     });
-    if (view.snapshot !== this.store.ledgerView().snapshot || beforeTasks !== JSON.stringify(this.store.tasks().map(task => [task.id, task.state, task.revisions, task.failures])) || beforeMessage !== (this.store.messages(null).at(-1)?.id || 0)) {
+    if (beforeMessage !== this.messageCutoff() || !this.candidateIsCurrent(candidate)) {
       this.store.event('goal.changed_during_review', { round });
       return { kind: 'changed' };
     }
-    const verifiedIDs = new Set(view.verified.map(fact => fact.id));
-    if (new Set(result.fact_ids).size !== result.fact_ids.length || result.fact_ids.some(id => !verifiedIDs.has(id))) throw new Error('목표 판정이 현재 검증되지 않은 사실을 인용했습니다.');
-    if (result.next_tasks.length > this.config.maxTasks) throw new Error('목표 판정의 다음 작업 수가 사이클 상한을 초과했습니다.');
-    if (result.decision === 'complete' && (result.next_tasks.length || result.question.trim())) throw new Error('완료 판정에는 다음 작업이나 질문을 포함할 수 없습니다.');
-    if (result.decision === 'continue' && (!result.next_tasks.length || result.question.trim())) throw new Error('계속 판정에는 하나 이상의 다음 작업과 빈 질문이 필요합니다.');
-    if (result.decision === 'needs_input' && (result.next_tasks.length || !result.question.trim())) throw new Error('입력 대기 판정에는 다음 작업 없이 정확한 질문이 필요합니다.');
-    if (result.decision === 'complete' && (!view.tasks.some(task => task.state === 'accepted') || view.conflicted.length)) throw new Error('승인된 작업과 충돌 없는 근거 없이 목표를 완료할 수 없습니다.');
+    this.validateGoalAssessment(result, contract, view);
+    let assessment = { ...result,
+      fact_ids: [...new Set(result.requirement_evaluations.flatMap(item => item.fact_ids))].sort((a, b) => a - b),
+      round, at: now() };
     if (result.decision === 'needs_input' && this.config.inputPolicy === 'continue') {
       const feedback = `무인 연속 실행 정책에서는 사용자 입력을 기다릴 수 없습니다. 질문(${result.question})은 차단 사유가 아닙니다. 범위·기준선·우선순위·검증 방법처럼 되돌릴 수 있는 선택은 가장 안전하고 제한적인 합리적 기본값을 채택해 가정으로 기록하고, 실제 작업을 수행할 다음 작업을 제안하세요. 외부 자원이 없으면 가능한 우회·대체 검증·부분 구현을 시도하세요.`;
       this.store.setMeta('goal:round', round);
+      this.store.setMeta('goal:assessment', assessment);
       this.store.setMeta('goal:feedback', feedback);
       this.store.setMeta('state', 'running');
       this.store.event('goal.input_bypassed', { round, question: result.question, reason: result.reason });
+      const progress = this.progressState(assessment);
+      if (round >= this.config.maxGoalRounds) return this.concludeAssessment(assessment, 'budget_exhausted', candidate);
+      if (progress.stagnant >= this.config.maxNoProgress) return this.concludeAssessment(assessment, 'no_progress', candidate);
       return { kind: 'retry' };
     }
-    const assessment = { ...result, round, at: now() };
     this.store.setMeta('goal:round', round);
     this.store.setMeta('goal:assessment', assessment);
     this.store.setMeta('goal:feedback', '');
     this.store.event('goal.assessed', { round, decision: result.decision, reason: result.reason, progress: result.progress });
-    if (result.decision === 'complete') return { kind: 'complete', assessment };
+    if (result.decision === 'achieved') {
+      const { result: review } = await this.runAgent('goal_review', null, {
+        facts: view.compactFacts,
+        candidate: assessment,
+        context: { ...view.knowledge, coverage: view.coverage, tasks: view.compactTasks,
+          conflicts: view.conflicted.map(({ id, key, claim }) => ({ id, key, claim })) },
+      });
+      this.validateGoalReview(review, contract);
+      if (!this.candidateIsCurrent(candidate)) {
+        this.store.event('goal.changed_during_review', { round, stage: 'independent_review' });
+        return { kind: 'changed' };
+      }
+      assessment = { ...assessment, independent_review: { ...review, at: now() } };
+      this.store.setMeta('goal:assessment', assessment);
+      if (review.decision === 'reject') {
+        this.store.setMeta('goal:feedback', `독립 완료 검토가 달성 후보를 거절했습니다: ${review.reason}`);
+        this.store.event('goal.achievement_rejected', { round, reason: review.reason });
+        if (round >= this.config.maxGoalRounds) return this.concludeAssessment(assessment, 'budget_exhausted', candidate);
+        return { kind: 'retry' };
+      }
+      return { kind: 'achieved', assessment, candidate };
+    }
     if (result.decision === 'needs_input') {
       this.store.setMeta('state', 'waiting_input');
       this.store.event('goal.waiting_input', { round, question: result.question });
       return { kind: 'waiting', marker: beforeMessage };
     }
+    const progress = this.progressState(assessment);
+    if (round >= this.config.maxGoalRounds) return this.concludeAssessment(assessment, 'budget_exhausted', candidate);
+    if (progress.stagnant >= this.config.maxNoProgress) return this.concludeAssessment(assessment, 'no_progress', candidate);
     const scheduled = this.queueGoalTasks(result.next_tasks, round, result.reason);
     if (!scheduled.length) {
       const feedback = '계속 판정이 실행 가능한 새 작업을 만들지 못했습니다. 완료된 작업을 반복하지 말고 다른 구체적 접근을 제안하세요.';
@@ -459,7 +876,7 @@ export class Engine {
     while (!this.abortController.signal.aborted) {
       await this.poll();
       if (this.store.getMeta('control') === 'paused') { await sleep(300); continue; }
-      if (this.store.readyTasks().length || (this.store.messages(null).at(-1)?.id || 0) > marker) {
+      if (this.store.readyTasks().length || this.messageCutoff() > marker) {
         this.store.setMeta('state', 'running');
         this.store.event('goal.resumed', { after_message: marker });
         return;
@@ -467,40 +884,143 @@ export class Engine {
       await sleep(300);
     }
   }
-  async report(assessment) {
+  writeResult(value) {
+    const resultPath = path.join(this.directory, 'result.json');
+    try { writeJSON(resultPath, value); }
+    catch (error) {
+      if (!fs.existsSync(resultPath)) throw error;
+      try {
+        fs.chmodSync(resultPath, 0o600);
+        writeJSON(resultPath, value);
+        this.store.event('report.result_permissions_repaired', { reason: error.message });
+      } catch (retryError) {
+        retryError.cause = error;
+        throw retryError;
+      }
+    }
+  }
+  async report(outcome) {
+    const { assessment, candidate } = outcome;
+    const goalOutcome = outcome.kind === 'achieved' ? 'achieved' : 'not_established';
+    const terminationReason = outcome.kind === 'achieved' ? 'goal_achieved' : outcome.terminationReason;
+    if (!candidate || !this.candidateIsCurrent(candidate)) return 'changed';
+    this.store.setMeta('goal:pending_terminal', { kind: outcome.kind, assessment, candidate,
+      ...(outcome.kind === 'achieved' ? {} : { terminationReason }) });
+    const contract = this.store.getMeta('goal:contract');
     const view = this.goalContext();
     const { tasks, verified: facts, conflicted } = view;
-    const messageCutoff = this.store.messages(null).at(-1)?.id || 0;
-    const taskSnapshot = JSON.stringify(tasks.map(task => [task.id, task.state]));
-    let editor;
-    try {
-      const { result } = await this.runAgent('editor', null, {
-        facts: view.compactFacts,
-        context: { ...view.knowledge, coverage: view.coverage, task_counts: view.counts, goal_assessment: assessment,
-          tasks: view.compactTasks, conflicts: conflicted.map(({ id, key, claim }) => ({ id, key, claim })) },
-      });
-      if (new Set(result.fact_ids).size !== result.fact_ids.length || result.fact_ids.some(id => !facts.some(fact => fact.id === id))) throw new Error('최종 보고서에 중복 또는 검증되지 않은 사실 인용');
-      editor = result;
-    } catch (error) {
-      if (this.abortController.signal.aborted) throw error;
-      this.store.event('report.editor_failed', { reason: error.message });
-      editor = { title: 'ID2A 결과', body: '최종 편집 세션이 실패했습니다. 아래 원장과 작업 상태를 확인하세요.', fact_ids: [] };
+    if (goalOutcome === 'achieved') {
+      this.validateGoalAssessment(assessment, contract, view);
+      this.validateGoalReview(assessment.independent_review, contract);
     }
-    if (view.snapshot !== this.store.ledgerView().snapshot || this.store.getMeta('control') !== 'running' || taskSnapshot !== JSON.stringify(this.store.tasks().map(task => [task.id, task.state])) || messageCutoff !== (this.store.messages(null).at(-1)?.id || 0)) return 'changed';
+    const editorConfiguration = { ...this.settings('editor'), timeout: this.config.timeout, permissions: this.config.permissions,
+      codexBin: this.config.codexBin || null, claudeBin: this.config.claudeBin || null };
+    const reportID = hash(JSON.stringify({ candidate, goalOutcome, terminationReason, assessment, editorConfiguration }));
+    this.store.setMeta('report:status', { state: 'generating', id: reportID, contract_revision: contract.revision, assessment_round: assessment.round });
+    const validateEditor = result => {
+      if (new Set(result.fact_ids).size !== result.fact_ids.length || result.fact_ids.some(id => !facts.some(fact => fact.id === id))) throw new Error('최종 보고서에 중복 또는 검증되지 않은 사실 인용');
+      if (result.fact_ids.some(id => !view.currentFactIDs.has(id))) throw new Error('최종 보고서에 현재 원본과 일치하지 않는 오래된 사실 인용');
+    };
+    let editor = null;
+    let editorError = null;
+    const draft = this.store.getMeta('report:draft');
+    if (draft?.id === reportID && draft.editor) {
+      try {
+        validateEditor(draft.editor);
+        editor = draft.editor;
+        editorError = draft.editor_error || null;
+        this.store.event('report.draft_reused', { id: reportID });
+      } catch (error) { this.store.event('report.draft_invalid', { id: reportID, reason: error.message }); }
+    }
+    if (!editor) {
+      try {
+        const { result } = await this.runAgent('editor', null, {
+          facts: view.compactFacts,
+          context: { ...view.knowledge, coverage: view.coverage, task_counts: view.counts, goal_assessment: assessment,
+            committed_outcome: goalOutcome, termination_reason: terminationReason,
+            tasks: view.compactTasks, conflicts: conflicted.map(({ id, key, claim }) => ({ id, key, claim })) },
+        });
+        validateEditor(result);
+        editor = result;
+      } catch (error) {
+        if (this.abortController.signal.aborted) throw error;
+        editorError = error.message;
+        this.store.event('report.editor_failed', { reason: error.message });
+        editor = { title: 'ID2A 결과', body: '최종 편집 세션이 실패했습니다. 아래 원장과 작업 상태를 확인하세요.', fact_ids: [] };
+      }
+      this.store.setMeta('report:draft', { id: reportID, editor, ...(editorError ? { editor_error: editorError } : {}), created_at: now() });
+    }
+    if (!this.candidateIsCurrent(candidate)) {
+      this.store.setMeta('report:status', { state: 'stale', id: reportID, contract_revision: contract.revision, assessment_round: assessment.round });
+      this.store.setMeta('goal:pending_terminal', null);
+      return 'changed';
+    }
     const state = 'completed';
-    const manifest = { run: this.manifest.id, state, source: this.manifest.source, current_source: sourceIdentity(this.config.workspace), goal: assessment, tasks, facts, conflicts: conflicted, editor, ended: now() };
-    writeJSON(path.join(this.directory, 'result.json'), manifest);
-    const lines = [`# ${editor.title}`, '', `Run: ${this.manifest.id}`, `상태: ${state}`, `자료 폴더: ${this.config.workspace}`, '', `목표 판정: ${assessment.reason}`, `진행 요약: ${assessment.progress}`, '', editor.body, '', '## 작업', '',
+    const termination = { reason: terminationReason, at: now(), assessment_round: assessment.round, contract_revision: contract.revision };
+    const generating = { state: 'generating', id: reportID, contract_revision: contract.revision,
+      assessment_round: assessment.round, generation: editorError ? 'controller_fallback' : 'editor', ...(editorError ? { editor_error: editorError } : {}) };
+    if (!this.store.commitGoalOutcome(candidate, { outcome: goalOutcome, termination, assessment, report: generating })) {
+      this.store.setMeta('goal:pending_terminal', null);
+      return 'changed';
+    }
+    const manifest = { format_version: 3, goal_format_version: this.store.getMeta('goal:format_version', 0),
+      run: this.manifest.id, state, execution: { state }, goal_outcome: goalOutcome,
+      termination, report: generating, contract, source: this.manifest.source, current_source: sourceIdentity(this.config.workspace),
+      goal: assessment, tasks, facts, conflicts: conflicted, editor, ended: now() };
+    const outcomeLabel = goalOutcome === 'achieved' ? '달성' : '미입증';
+    const lines = [`# ${editor.title}`, '', `Run: ${this.manifest.id}`, `실행 상태: ${state}`, `목표 결과: ${outcomeLabel}`, `종료 이유: ${terminationReason}`,
+      `자료 폴더: ${this.config.workspace}`, '', `목표 판정: ${assessment.reason}`, `진행 요약: ${assessment.progress}`, '', '## 필수 조건', '',
+      ...assessment.requirement_evaluations.map(item => `- ${item.requirement_id} [${item.verdict}] ${item.reason}${item.fact_ids.length ? ` — ${item.fact_ids.map(id => `F${id}`).join(', ')}` : ''}`),
+      '', editor.body, '', '## 작업', '',
       ...tasks.map(task => `- T${task.id} [${task.state}] ${task.title}${task.feedback ? ' — ' + task.feedback : ''}`), '', '## 검증된 사실과 증거', ''];
     for (const fact of facts) {
       lines.push(`- F${fact.id} [${fact.kind}] ${fact.key}: ${fact.claim}`);
       for (const evidence of fact.evidence) lines.push(`  - SHA-256 ${evidence.sha256}; 원본 ${evidence.source}; 보관 ${evidence.artifact}`);
     }
     if (conflicted.length) lines.push('', '## 해결되지 않은 충돌', '', ...conflicted.map(fact => `- F${fact.id} ${fact.key}: ${fact.claim}`));
-    fs.writeFileSync(path.join(this.directory, 'report.md'), lines.join('\n') + '\n', 'utf8');
-    this.store.setMeta('state', state);
-    this.store.event('run.finished', { state, tasks: tasks.length, verified: facts.length, report: path.join(this.directory, 'report.md') });
+    const reportPath = path.join(this.directory, 'report.md');
+    try {
+      this.writeResult(manifest);
+      fs.writeFileSync(reportPath, lines.join('\n') + '\n', 'utf8');
+      const complete = { ...generating, state: 'complete', path: reportPath, completed_at: now() };
+      this.writeResult({ ...manifest, report: complete });
+      this.store.setMeta('report:status', complete);
+      this.store.event('run.finished', { state, goal_outcome: goalOutcome, termination_reason: terminationReason,
+        tasks: tasks.length, verified: facts.length, report: reportPath });
+    } catch (error) {
+      const failed = { ...generating, state: 'failed', reason: error.message, failed_at: now() };
+      this.store.setMeta('report:status', failed);
+      let resultError = null;
+      try { this.writeResult({ ...manifest, report: failed }); }
+      catch (writeError) { resultError = writeError.message; }
+      this.store.event('report.write_failed', { reason: error.message, goal_outcome: goalOutcome,
+        ...(resultError ? { result_error: resultError } : {}) });
+    }
     return state;
+  }
+  async resumeTerminalReport(outcome, eventType) {
+    this.store.setMeta('control', 'running');
+    this.store.setMeta('state', 'running');
+    this.store.event(eventType, { kind: outcome.kind, round: outcome.assessment.round });
+    const ticker = setInterval(() => this.poll().catch(error => this.store.event('controller.warning', { reason: error.message })), 300);
+    try { return await this.report(outcome); }
+    catch (error) {
+      if (this.abortController.signal.aborted) {
+        this.store.setMeta('state', 'stopped');
+        this.store.setMeta('run:termination', { reason: 'user_stopped', at: now() });
+        const report = this.store.getMeta('report:status', { state: 'not_started' });
+        if (report.state === 'generating') this.store.setMeta('report:status', { ...report, state: 'stale', reason: 'user_stopped' });
+        this.store.event('run.stopped', { resume: this.directory, stage: 'report' });
+        return 'stopped';
+      }
+      this.store.setMeta('state', 'failed');
+      this.store.setMeta('run:termination', { reason: 'controller_error', at: now(), detail: error.message });
+      this.store.event('run.failed', { reason: error.message, stage: 'report' });
+      throw error;
+    } finally {
+      clearInterval(ticker);
+      while (this.polling) await sleep(10);
+    }
   }
   async run() {
     const source = sourceIdentity(this.config.workspace);
@@ -508,19 +1028,79 @@ export class Engine {
     if (source.path !== expected.path) throw new Error('자료 폴더 경로가 바뀌었습니다. 올바른 workspace로 다시 실행하세요.');
     if (JSON.stringify(source) !== JSON.stringify(expected)) this.store.event('workspace.external_change', { expected, current: source });
     this.store.setMeta('source:current', source);
+    const previousStatus = this.store.completionStatus();
+    const pendingTerminal = this.pendingTerminalOutcome();
+    if (pendingTerminal && this.terminalLimitStillApplies(pendingTerminal)) {
+      const resumed = await this.resumeTerminalReport(pendingTerminal, 'report.resume_pending');
+      if (resumed !== 'changed') return resumed;
+    } else if (pendingTerminal) {
+      this.store.setMeta('goal:pending_terminal', null);
+      this.store.event('goal.pending_terminal_discarded', { reason: 'budget_increased', round: pendingTerminal.assessment.round });
+    }
+    const reusableTerminal = this.reusableTerminalOutcome(previousStatus);
+    if (reusableTerminal && this.terminalLimitStillApplies(reusableTerminal)) {
+      this.store.setMeta('control', 'running');
+      if (this.completedReportIsCurrent(previousStatus)) {
+        this.store.event('run.resume_noop', { goal_outcome: previousStatus.goal_outcome,
+          termination_reason: previousStatus.termination?.reason });
+        return 'completed';
+      }
+      const repaired = await this.resumeTerminalReport(reusableTerminal, 'report.retry');
+      if (repaired !== 'changed') return repaired;
+    }
+    if (['completed', 'stopped', 'failed'].includes(previousStatus.execution_state)) {
+      const history = this.store.getMeta('run:history', []);
+      history.push({ ...previousStatus, recorded_at: now(), assessment: this.store.getMeta('goal:assessment') });
+      this.store.setMeta('run:history', history.slice(-100));
+    }
     this.store.recover();
     this.store.setMeta('control', 'running');
     this.store.setMeta('state', 'running');
+    this.store.setMeta('goal:outcome', 'pending');
+    this.store.setMeta('run:termination', null);
+    const previousReport = this.store.getMeta('report:status', { state: 'not_started' });
+    if (['complete', 'failed', 'generating'].includes(previousReport.state)) this.store.setMeta('report:status', { ...previousReport, state: 'stale' });
     this.store.event('run.started', { run: this.manifest.id });
     const ticker = setInterval(() => this.poll().catch(error => this.store.event('controller.warning', { reason: error.message })), 300);
     try {
-      let planFailures = 0;
-      while (!this.store.getMeta('planned') && !this.abortController.signal.aborted) {
-        try { await this.plan(); planFailures = 0; }
+      while (!this.abortController.signal.aborted) {
+        this.assertControlBudget('contract');
+        try {
+          await this.ensureGoalContract();
+          this.resetControlFailures('contract');
+          break;
+        }
         catch (error) {
-          planFailures++;
+          if (error.code === 'ID2A_ATTEMPT_BUDGET') throw error;
+          const contractFailures = this.recordControlFailure('contract', error);
+          this.store.setMeta('state', 'retrying');
+          this.store.event('goal.contract_retry', { failures: contractFailures, reason: error.message });
+          if (contractFailures >= this.config.maxControlFailures) throw error;
+          await sleep(Math.min(30000, 1000 * (2 ** Math.min(contractFailures - 1, 5))));
+        }
+      }
+      this.store.setMeta('state', 'running');
+      while (!this.store.getMeta('planned') && !this.abortController.signal.aborted) {
+        if (this.attemptBudgetExhausted()) {
+          const reported = await this.report(this.attemptBudgetConclusion());
+          if (reported === 'changed') throw new AttemptBudgetError(this.config.maxAttempts);
+          return reported;
+        }
+        this.assertControlBudget('plan');
+        try {
+          await this.plan();
+          this.resetControlFailures('plan');
+        }
+        catch (error) {
+          if (error.code === 'ID2A_ATTEMPT_BUDGET') {
+            const reported = await this.report(this.attemptBudgetConclusion());
+            if (reported === 'changed') throw error;
+            return reported;
+          }
+          const planFailures = this.recordControlFailure('plan', error);
           this.store.setMeta('state', 'retrying');
           this.store.event('plan.retry', { failures: planFailures, reason: error.message });
+          if (planFailures >= this.config.maxControlFailures) throw error;
           await sleep(Math.min(30000, 1000 * (2 ** Math.min(planFailures - 1, 5))));
         }
       }
@@ -530,10 +1110,14 @@ export class Engine {
         catch (error) { this.store.event('followup.failed', { task: task.id, reason: error.message }); }
       }
       this.queueConflicts();
-      let goalFailures = 0;
       while (!this.abortController.signal.aborted) {
         await this.poll();
         if (this.store.getMeta('control') === 'paused') { await sleep(200); continue; }
+        if (!this.activeTasks.size && this.attemptBudgetExhausted()) {
+          const reported = await this.report(this.attemptBudgetConclusion());
+          if (reported === 'changed') throw new AttemptBudgetError(this.config.maxAttempts);
+          return reported;
+        }
         if (!this.activeTasks.size && this.store.tasks().some(task => task.state === 'accepted')) await this.curate(false);
         const ready = this.store.readyTasks().filter(task => !this.activeTasks.has(task.id));
         for (const task of ready) {
@@ -550,20 +1134,30 @@ export class Engine {
           if (this.store.readyTasks().length || this.store.getMeta('control') !== 'running') continue;
           let outcome;
           try {
-            outcome = await this.assessGoal();
-            goalFailures = 0;
+            this.assertControlBudget('goal');
+            await this.ensureGoalContract();
+            outcome = this.store.getMeta('goal:round', 0) >= this.config.maxGoalRounds
+              ? this.goalRoundBudgetConclusion()
+              : await this.assessGoal();
+            this.resetControlFailures('goal');
           } catch (error) {
-            goalFailures++;
+            if (error.code === 'ID2A_ATTEMPT_BUDGET') {
+              const reported = await this.report(this.attemptBudgetConclusion());
+              if (reported === 'changed') throw error;
+              return reported;
+            }
+            const goalFailures = this.recordControlFailure('goal', error);
             this.store.setMeta('state', 'retrying');
             this.store.setMeta('goal:feedback', error.message);
             this.store.event('goal.retry', { failures: goalFailures, reason: error.message });
+            if (goalFailures >= this.config.maxControlFailures) throw error;
             await sleep(Math.min(30000, 1000 * (2 ** Math.min(goalFailures - 1, 5))));
             continue;
           }
           if (outcome.kind === 'changed' || outcome.kind === 'continue') continue;
           if (outcome.kind === 'retry') { await sleep(1000); continue; }
           if (outcome.kind === 'waiting') { await this.waitForInstruction(outcome.marker); continue; }
-          const reported = await this.report(outcome.assessment);
+          const reported = await this.report(outcome);
           if (reported === 'changed') continue;
           return reported;
         }
@@ -571,15 +1165,20 @@ export class Engine {
       }
       await Promise.allSettled(this.activeTasks.values());
       this.store.setMeta('state', 'stopped');
+      this.store.setMeta('run:termination', { reason: 'user_stopped', at: now() });
       this.store.event('run.stopped', { resume: this.directory });
       return 'stopped';
     } catch (error) {
       if (this.abortController.signal.aborted) {
         await Promise.allSettled(this.activeTasks.values());
         this.store.setMeta('state', 'stopped');
+        this.store.setMeta('run:termination', { reason: 'user_stopped', at: now() });
+        const report = this.store.getMeta('report:status', { state: 'not_started' });
+        if (report.state === 'generating') this.store.setMeta('report:status', { ...report, state: 'stale', reason: 'user_stopped' });
         return 'stopped';
       }
       this.store.setMeta('state', 'failed');
+      this.store.setMeta('run:termination', { reason: 'controller_error', at: now(), detail: error.message });
       this.store.event('run.failed', { reason: error.message });
       throw error;
     } finally {

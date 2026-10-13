@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { boundedJSON, hash, integer, normalize, now, within } from './util.mjs';
-import { schemas, validate } from './schemas.mjs';
+import { boundedJSON, hash, integer, normalize, now, readText, within } from './util.mjs';
+import { goalAnchor, schemas, validate } from './schemas.mjs';
 
 export class Store {
   constructor(directory, { readOnly = false, onEvent } = {}) {
@@ -33,9 +33,9 @@ export class Store {
       );
       CREATE TABLE IF NOT EXISTS evidence (
         id INTEGER PRIMARY KEY, fact_id INTEGER NOT NULL REFERENCES facts(id),
-        task_id INTEGER NOT NULL REFERENCES tasks(id), sha256 TEXT NOT NULL,
+        task_id INTEGER NOT NULL REFERENCES tasks(id), submission INTEGER NOT NULL DEFAULT 1, sha256 TEXT NOT NULL,
         source TEXT NOT NULL, note TEXT NOT NULL, bytes INTEGER NOT NULL,
-        UNIQUE(fact_id, task_id, sha256, note)
+        UNIQUE(fact_id, task_id, submission, source, sha256, note)
       );
       CREATE TABLE IF NOT EXISTS attempts (
         id INTEGER PRIMARY KEY, task_id INTEGER REFERENCES tasks(id), role TEXT NOT NULL,
@@ -60,6 +60,33 @@ export class Store {
         INSERT INTO fact_search(rowid, key, scope, claim) VALUES(new.id, new.key, new.scope, new.claim);
       END;
     `);
+    const evidenceColumns = this.db.prepare('PRAGMA table_info(evidence)').all();
+    const hasSubmission = evidenceColumns.some(column => column.name === 'submission');
+    const expectedUnique = ['fact_id', 'task_id', 'submission', 'source', 'sha256', 'note'];
+    const hasSubmissionUnique = this.db.prepare('PRAGMA index_list(evidence)').all()
+      .filter(index => index.unique)
+      .some(index => {
+        const name = index.name.replaceAll("'", "''");
+        const columns = this.db.prepare(`PRAGMA index_info('${name}')`).all().map(column => column.name);
+        return JSON.stringify(columns) === JSON.stringify(expectedUnique);
+      });
+    if (!hasSubmission || !hasSubmissionUnique) {
+      const submission = hasSubmission ? 'submission' : '1';
+      this.db.exec(`
+        BEGIN IMMEDIATE;
+        ALTER TABLE evidence RENAME TO evidence_migration;
+        CREATE TABLE evidence (
+          id INTEGER PRIMARY KEY, fact_id INTEGER NOT NULL REFERENCES facts(id),
+          task_id INTEGER NOT NULL REFERENCES tasks(id), submission INTEGER NOT NULL DEFAULT 1, sha256 TEXT NOT NULL,
+          source TEXT NOT NULL, note TEXT NOT NULL, bytes INTEGER NOT NULL,
+          UNIQUE(fact_id, task_id, submission, source, sha256, note)
+        );
+        INSERT INTO evidence(id,fact_id,task_id,submission,sha256,source,note,bytes)
+          SELECT id,fact_id,task_id,${submission},sha256,source,note,bytes FROM evidence_migration;
+        DROP TABLE evidence_migration;
+        COMMIT;
+      `);
+    }
     fs.mkdirSync(path.join(this.directory, 'artifacts'), { recursive: true });
   }
   close() { this.db.close(); }
@@ -74,6 +101,28 @@ export class Store {
   }
   setMeta(key, value) {
     this.db.prepare('INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, JSON.stringify(value));
+  }
+  goalSource() {
+    const goal = readText(path.join(this.directory, 'prompt.txt'));
+    const instructions = this.db.prepare("SELECT id,text FROM messages WHERE target='all' ORDER BY id").all()
+      .map(message => ({ id: message.id, text: message.text, sha256: hash(message.text) }));
+    const messageCutoff = instructions.at(-1)?.id || 0;
+    const identity = { goal_sha256: hash(goal), instructions: instructions.map(({ id, sha256 }) => ({ id, sha256 })), message_cutoff: messageCutoff };
+    return { ...identity, fingerprint: hash(JSON.stringify(identity)), effective_text: [goal, ...instructions.map(item => item.text)].join('\n') };
+  }
+  completionStatus() {
+    const state = this.getMeta('state');
+    const explicitOutcome = this.getMeta('goal:outcome');
+    const termination = this.getMeta('run:termination');
+    const report = this.getMeta('report:status');
+    return {
+      format_version: 3,
+      goal_format_version: this.getMeta('goal:format_version', 0),
+      execution_state: state,
+      goal_outcome: explicitOutcome || (state === 'completed' ? 'legacy_unknown' : 'pending'),
+      termination: termination || (state === 'completed' ? { reason: 'legacy_unknown' } : null),
+      report: report || (fs.existsSync(path.join(this.directory, 'report.md')) ? { state: 'legacy_unknown' } : { state: 'not_started' }),
+    };
   }
   event(type, data = {}) {
     const time = now();
@@ -194,16 +243,20 @@ export class Store {
       if (!fact.evidence.length) throw new Error(`${key}: 증거 파일이 필요합니다.`);
       return { ...fact, key, claim: normalize(fact.claim), evidence: fact.evidence.map(reference => this.ingestEvidence(reference, taskDirectory, workspace)) };
     });
-    const ids = this.transaction(() => prepared.map(fact => {
+    const ids = this.transaction(() => {
+      const submission = Number(this.db.prepare('SELECT COALESCE(MAX(submission),0)+1 AS id FROM evidence WHERE task_id=?').get(taskID).id);
+      return prepared.map(fact => {
       const claimHash = hash(fact.claim);
       this.db.prepare('INSERT OR IGNORE INTO facts(key,scope,kind,claim,claim_hash,created) VALUES (?,?,?,?,?,?)')
         .run(fact.key, fact.scope, fact.kind, fact.claim, claimHash, now());
       const row = this.db.prepare('SELECT id FROM facts WHERE key=? AND claim_hash=? AND kind=?').get(fact.key, claimHash, fact.kind);
       this.db.prepare('INSERT OR IGNORE INTO origins VALUES (?,?)').run(row.id, taskID);
-      for (const evidence of fact.evidence) this.db.prepare('INSERT OR IGNORE INTO evidence(fact_id,task_id,sha256,source,note,bytes) VALUES (?,?,?,?,?,?)')
-        .run(row.id, taskID, evidence.sha256, evidence.source, evidence.note, evidence.bytes);
+      for (const evidence of fact.evidence) this.db.prepare(
+        'INSERT OR IGNORE INTO evidence(fact_id,task_id,submission,sha256,source,note,bytes) VALUES (?,?,?,?,?,?,?)'
+      ).run(row.id, taskID, submission, evidence.sha256, evidence.source, evidence.note, evidence.bytes);
       return row.id;
-    }));
+      });
+    });
     this.updateTask(taskID, { result: { ...result, fact_ids: [...new Set(ids)] }, state: 'reviewing' });
     this.event('facts.proposed', { task: taskID, facts: [...new Set(ids)] });
     return [...new Set(ids)];
@@ -231,16 +284,117 @@ export class Store {
       : this.db.prepare('SELECT id FROM facts ORDER BY id').all();
     return rows.map(row => this.fact(row.id));
   }
+  ledgerData() {
+    const facts = this.allFacts(), tasks = this.tasks();
+    const digests = this.db.prepare('SELECT * FROM digests ORDER BY id').all()
+      .map(row => ({ ...row, fact_ids: JSON.parse(row.fact_ids) }));
+    return { facts, tasks, digests, snapshot: hash(JSON.stringify({ facts, tasks, digests })), as_of: now() };
+  }
   ledgerView() {
     // Read every collection from one SQLite snapshot. The content fingerprint also
     // works across independent read-only MCP connections and existing run ledgers.
     this.db.exec('BEGIN');
-    try {
-      const facts = this.allFacts(), tasks = this.tasks();
-      const digests = this.db.prepare('SELECT * FROM digests ORDER BY id').all()
-        .map(row => ({ ...row, fact_ids: JSON.parse(row.fact_ids) }));
-      return { facts, tasks, digests, snapshot: hash(JSON.stringify({ facts, tasks, digests })), as_of: now() };
-    } finally { this.db.exec('COMMIT'); }
+    try { return this.ledgerData(); }
+    finally { this.db.exec('COMMIT'); }
+  }
+  evidenceStatus(view = this.ledgerView()) {
+    const fileStates = new Map();
+    const inspect = file => {
+      if (fileStates.has(file)) return fileStates.get(file);
+      let state;
+      try {
+        const stat = fs.statSync(file);
+        state = stat.isFile() ? { exists: true, bytes: stat.size, sha256: hash(fs.readFileSync(file)) } : { exists: false, bytes: 0, sha256: null };
+      } catch { state = { exists: false, bytes: 0, sha256: null }; }
+      fileStates.set(file, state);
+      return state;
+    };
+    const facts = {};
+    for (const fact of view.facts.filter(item => item.state === 'verified')) {
+      // Evidence submitted by one task is conjunctive; a later independent task
+      // may provide an alternative complete evidence set for the same claim.
+      const checks = fact.evidence.map(evidence => ({ submission: `${evidence.task_id}:${evidence.submission || 1}`,
+        current: inspect(evidence.source).sha256 === evidence.sha256 }));
+      const bySubmission = Map.groupBy(checks, item => item.submission);
+      facts[fact.id] = [...bySubmission.values()].some(group => group.length > 0 && group.every(item => item.current));
+    }
+    const artifacts = view.tasks.flatMap(task => (this.taskRecord(task).result?.artifacts || []).map(artifact => ({ task: task.id, ...artifact })));
+    const sources = [...fileStates].map(([file, state]) => ({ file, ...state })).sort((left, right) => left.file.localeCompare(right.file));
+    return { facts, snapshot: hash(JSON.stringify({ sources, artifacts })), sources, artifacts };
+  }
+  commitGoalOutcome(candidate, { outcome, termination, assessment, report }) {
+    if (!['achieved', 'not_established'].includes(outcome)) throw new Error(`잘못된 목표 결과: ${outcome}`);
+    if (outcome === 'achieved' && assessment?.decision !== 'achieved') throw new Error('달성 후보 없이 목표 달성을 기록할 수 없습니다.');
+    if (outcome !== 'achieved' && termination?.reason === 'goal_achieved') throw new Error('미입증 목표에 성공 종료 이유를 기록할 수 없습니다.');
+    const committed = this.transaction(() => {
+      const view = this.ledgerData();
+      const messageCutoff = Number(this.db.prepare('SELECT COALESCE(MAX(id),0) AS id FROM messages').get().id);
+      const contract = this.getMeta('goal:contract');
+      const evidence = this.evidenceStatus(view);
+      if (this.getMeta('control') !== 'running'
+          || view.snapshot !== candidate.ledger_snapshot
+          || evidence.snapshot !== candidate.evidence_snapshot
+          || messageCutoff !== candidate.message_cutoff
+          || hash(JSON.stringify(contract)) !== candidate.contract_hash) return false;
+      if (!contract || candidate.contract_revision !== contract.revision || assessment?.contract_revision !== contract.revision) {
+        throw new Error('현재 목표 계약과 일치하지 않는 최종 판정입니다.');
+      }
+      const expected = contract.requirements.map(item => item.id);
+      const source = this.goalSource();
+      const sourceText = normalize(source.effective_text);
+      if (contract.format_version !== 1 || expected.length < 2 || expected[0] !== 'G0'
+          || new Set(expected).size !== expected.length
+          || expected.slice(1).some((id, index) => id !== `R${index + 1}`)
+          || !contract.objective?.trim()
+          || contract.requirements.some(item => !['outcome', 'deliverable', 'constraint'].includes(item.type)
+            || !item.statement?.trim() || !item.source_reference?.trim() || !item.verification?.trim())
+          || Object.entries(goalAnchor).some(([key, value]) => contract.requirements[0][key] !== value)
+          || contract.requirements.slice(1).some(item => !sourceText.includes(normalize(item.source_reference)))
+          || contract.source?.fingerprint !== source.fingerprint || contract.source?.goal_sha256 !== source.goal_sha256) {
+        throw new Error('비어 있거나 손상된 목표 계약으로 최종 판정을 기록할 수 없습니다.');
+      }
+      const contractReview = contract.review;
+      const contractReviewed = Array.isArray(contractReview?.requirement_reviews)
+        ? contractReview.requirement_reviews.map(item => item.requirement_id) : [];
+      if (contractReview?.decision !== 'accept' || !Array.isArray(contractReview.missing_requirements)
+          || contractReview.missing_requirements.length || new Set(contractReviewed).size !== contractReviewed.length
+          || contractReviewed.length !== expected.length || contractReviewed.some(id => !expected.includes(id))
+          || contractReview.requirement_reviews.some(item => item.verdict !== 'covered')) {
+        throw new Error('독립 검토를 통과한 현재 목표 계약이 필요합니다.');
+      }
+      const evaluations = assessment?.requirement_evaluations || [];
+      const evaluated = evaluations.map(item => item.requirement_id);
+      if (new Set(evaluated).size !== evaluated.length || evaluated.length !== expected.length || evaluated.some(id => !expected.includes(id))) {
+        throw new Error('최종 판정이 모든 필수 조건을 정확히 한 번 포함하지 않습니다.');
+      }
+      if (outcome === 'achieved') {
+        const verified = new Set(view.facts.filter(fact => fact.state === 'verified').map(fact => fact.id));
+        if (evaluations.some(item => item.verdict !== 'satisfied' || !item.fact_ids.length
+            || new Set(item.fact_ids).size !== item.fact_ids.length
+            || item.fact_ids.some(id => !verified.has(id) || evidence.facts[id] !== true))) {
+          throw new Error('모든 필수 조건에 현재 검증된 충족 근거가 있어야 목표를 달성 처리할 수 있습니다.');
+        }
+        const independent = assessment.independent_review;
+        const reviewed = independent?.requirement_reviews?.map(item => item.requirement_id) || [];
+        if (independent?.decision !== 'accept' || independent.contract_revision !== contract.revision
+            || new Set(reviewed).size !== reviewed.length || reviewed.length !== expected.length
+            || reviewed.some(id => !expected.includes(id))
+            || independent.requirement_reviews.some(item => item.verdict !== 'accept')) {
+          throw new Error('현재 계약 전체를 승인한 독립 완료 검토가 필요합니다.');
+        }
+      } else if (assessment?.decision !== 'concluded' || !['budget_exhausted', 'no_progress', 'external_blocker'].includes(termination?.reason)) {
+        throw new Error('미입증 종료에는 유효한 비성공 판정과 종료 이유가 필요합니다.');
+      }
+      this.setMeta('goal:assessment', assessment);
+      this.setMeta('goal:candidate', candidate);
+      this.setMeta('goal:pending_terminal', null);
+      this.setMeta('goal:outcome', outcome);
+      this.setMeta('run:termination', termination);
+      this.setMeta('report:status', report);
+      this.setMeta('state', 'completed');
+      return true;
+    });
+    return committed;
   }
   validDigests(view, scope) {
     const verified = new Set(view.facts.filter(fact => fact.state === 'verified').map(fact => fact.id));
@@ -296,6 +450,7 @@ export class Store {
     limit = integer(limit, 'limit', 1, 50);
     if (offset && !snapshot) throw new Error('다음 페이지에는 첫 페이지의 snapshot이 필요합니다.');
     const view = this.ledgerView();
+    const evidence = collection === 'facts' ? this.evidenceStatus(view) : null;
     if (snapshot !== undefined && snapshot !== view.snapshot) throw new Error('원장이 변경되었습니다. snapshot을 생략하고 offset=0부터 다시 조회하세요.');
     let rows = collection === 'scopes' ? this.scopeIndex(view) : collection === 'digests' ? this.validDigests(view) : view[collection];
     rows = rows.filter(row => (!scope || row.scope === scope || row.scope.startsWith(scope + '.')) && (!state || row.state === state));
@@ -303,7 +458,8 @@ export class Store {
     let characters = 2;
     for (const row of rows.slice(offset, offset + limit)) {
       const item = collection === 'tasks' ? this.taskRecord(row) : collection === 'facts'
-        ? (({ id, key, scope, kind, state, claim }) => ({ id, key, scope, kind, state, claim }))(row) : row;
+        ? (({ id, key, scope, kind, state, claim }) => ({ id, key, scope, kind, state, claim,
+          current_evidence: evidence.facts[id] === true }))(row) : row;
       const size = JSON.stringify(item).length + (items.length ? 1 : 0);
       // Pages must be contiguous. Always return a first oversized item so callers
       // can advance without silently skipping a record.
@@ -364,6 +520,7 @@ export class Store {
   }
   context(task, characters = 12000) {
     const view = this.ledgerView();
+    const evidenceStatus = this.evidenceStatus(view);
     const byID = new Map(view.facts.map(fact => [fact.id, fact]));
     const relevant = this.search(task.scope + ' ' + task.brief, { limit: 50 }).map(fact => byID.get(fact.id)).filter(Boolean);
     const inherited = view.facts.filter(fact => fact.origins.some(id => task.dependencies.includes(id)));
@@ -371,6 +528,7 @@ export class Store {
     const facts = [...new Map([...inherited, ...relevant, ...scoped].map(fact => [fact.id, fact])).values()]
       .filter(fact => ['verified', 'conflicted'].includes(fact.state));
     const compact = fact => ({ id: fact.id, key: fact.key, kind: fact.kind, state: fact.state, claim: fact.claim,
+      current_evidence: evidenceStatus.facts[fact.id] === true,
       evidence: fact.evidence.slice(0, 2).map(item => ({ artifact: item.artifact, sha256: item.sha256 })) });
     const knowledge = this.knowledgeContext(view, Math.floor(characters / 4), task.scope);
     const { items, ...coverage } = boundedJSON(facts.map(compact), Math.floor(characters * 3 / 4));
@@ -423,6 +581,12 @@ export class Store {
   }
   beginAttempt(taskID, role, provider) {
     return Number(this.db.prepare('INSERT INTO attempts(task_id,role,provider,created) VALUES (?,?,?,?)').run(taskID || null, role, provider, now()).lastInsertRowid);
+  }
+  attemptCount({ includeEditor = true } = {}) {
+    const row = includeEditor
+      ? this.db.prepare('SELECT COUNT(*) AS count FROM attempts').get()
+      : this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE role<>'editor'").get();
+    return Number(row.count);
   }
   session(attemptID, sessionID, turnID = null) {
     this.db.prepare('UPDATE attempts SET session_id=?,turn_id=? WHERE id=?').run(sessionID, turnID, attemptID);

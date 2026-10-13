@@ -40,7 +40,10 @@ function call(name, args) {
   if (name === 'ledger_page') return store.ledgerPage(args);
   if (name === 'facts_search') {
     if (typeof args.query !== 'string') throw new Error('query 필요');
-    return store.search(args.query, { scope: args.scope, limit: integer(args.limit ?? 12, 'limit', 1, 30) });
+    const facts = store.search(args.query, { scope: args.scope, limit: integer(args.limit ?? 12, 'limit', 1, 30) });
+    const view = store.ledgerView();
+    const status = store.evidenceStatus(view);
+    return facts.map(fact => ({ ...fact, current_evidence: status.facts[fact.id] === true }));
   }
   if (name === 'facts_get') {
     const view = store.ledgerView();
@@ -48,7 +51,7 @@ function call(name, args) {
     const id = integer(args.id, 'id', 1, Number.MAX_SAFE_INTEGER);
     const fact = view.facts.find(item => item.id === id);
     if (!fact) throw new Error(`사실 F${id} 없음`);
-    return { ...fact, snapshot: view.snapshot, as_of: view.as_of };
+    return { ...fact, current_evidence: store.evidenceStatus(view).facts[fact.id] === true, snapshot: view.snapshot, as_of: view.as_of };
   }
   if (name === 'facts_context') return store.context(store.task(integer(args.task_id, 'task_id')));
   if (name === 'evidence_read') {

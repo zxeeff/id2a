@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { Store } from '../src/store.mjs';
 import { hash, readText } from '../src/util.mjs';
 import { fixture, task, workerResult, verdict } from './helpers.mjs';
@@ -119,6 +120,133 @@ test('negative results also need independent evidence and are available to later
   store.applyVerdict(id, verdict(ids), ids);
   assert.equal(store.context(store.task(id)).facts[0].kind, 'dead_end');
 });
+
+test('current evidence requires each file from one submission while allowing a later complete submission', t => {
+  const { store, workspace, directory } = setup(t);
+  const extra = path.join(workspace, 'extra.txt');
+  fs.writeFileSync(extra, 'Supporting detail.\n', 'utf8');
+  const one = store.addTask(task('Composite evidence'));
+  const composite = workerResult(workspace);
+  composite.facts[0].evidence.push({ path: extra, note: 'Supporting detail' });
+  const first = store.submitWorker(one, composite, directory, workspace);
+  store.applyVerdict(one, verdict(first), first);
+  const before = store.evidenceStatus();
+  assert.equal(before.facts[first[0]], true);
+  fs.writeFileSync(extra, 'Changed detail.\n', 'utf8');
+  const stale = store.evidenceStatus();
+  assert.equal(stale.facts[first[0]], false);
+  assert.notEqual(stale.snapshot, before.snapshot);
+
+  const two = store.addTask(task('Independent evidence'));
+  const second = store.submitWorker(two, workerResult(workspace), directory, workspace);
+  store.applyVerdict(two, verdict(second), second);
+  assert.deepEqual(second, first);
+  assert.equal(store.evidenceStatus().facts[first[0]], true);
+});
+
+test('a revised submission from the same task replaces its stale evidence set', t => {
+  const { store, workspace, directory } = setup(t);
+  const extra = path.join(workspace, 'extra.txt');
+  fs.writeFileSync(extra, 'Initial supporting detail.\n', 'utf8');
+  const id = store.addTask(task('Revised composite evidence'));
+  const initial = workerResult(workspace);
+  initial.facts[0].evidence.push({ path: extra, note: 'Supporting detail' });
+  const first = store.submitWorker(id, initial, directory, workspace);
+  store.applyVerdict(id, verdict(first), first);
+
+  fs.writeFileSync(path.join(workspace, 'notes.txt'), 'Node.js 24 or newer.\nUpdated verification.\n', 'utf8');
+  fs.writeFileSync(extra, 'Updated supporting detail.\n', 'utf8');
+  store.updateTask(id, { state: 'queued', result: null, revisions: 1 });
+  const revised = workerResult(workspace);
+  revised.facts[0].evidence.push({ path: extra, note: 'Supporting detail' });
+  const second = store.submitWorker(id, revised, directory, workspace);
+  store.applyVerdict(id, verdict(second), second);
+
+  assert.deepEqual(second, first);
+  assert.deepEqual([...new Set(store.fact(first[0]).evidence.map(item => item.submission))], [1, 2]);
+  assert.equal(store.evidenceStatus().facts[first[0]], true);
+});
+
+test('shared evidence remains a member of every revised submission that cited it', t => {
+  const { store, workspace, directory } = setup(t);
+  const fileB = path.join(workspace, 'b.txt'), fileC = path.join(workspace, 'c.txt');
+  fs.writeFileSync(fileB, 'Evidence B.\n', 'utf8');
+  fs.writeFileSync(fileC, 'Evidence C.\n', 'utf8');
+  const id = store.addTask(task('Overlapping submissions'));
+  const firstResult = workerResult(workspace);
+  firstResult.facts[0].evidence.push({ path: fileB, note: 'B' });
+  const first = store.submitWorker(id, firstResult, directory, workspace);
+  store.applyVerdict(id, verdict(first), first);
+
+  store.updateTask(id, { state: 'queued', result: null, revisions: 1 });
+  const secondResult = workerResult(workspace);
+  secondResult.facts[0].evidence.push({ path: fileC, note: 'C' });
+  const second = store.submitWorker(id, secondResult, directory, workspace);
+  store.applyVerdict(id, verdict(second), second);
+  assert.deepEqual(second, first);
+  const shared = store.fact(first[0]).evidence.filter(item => item.source === path.join(workspace, 'notes.txt'));
+  assert.deepEqual(shared.map(item => item.submission), [1, 2]);
+
+  fs.writeFileSync(path.join(workspace, 'notes.txt'), 'Changed shared evidence.\n', 'utf8');
+  assert.equal(store.evidenceStatus().facts[first[0]], false);
+});
+
+test('identical evidence files retain their distinct sources and both must remain current', t => {
+  const { store, workspace, directory } = setup(t);
+  const original = path.join(workspace, 'notes.txt');
+  const copy = path.join(workspace, 'copy.txt');
+  fs.copyFileSync(original, copy);
+  const id = store.addTask(task('Distinct identical evidence sources'));
+  const result = workerResult(workspace);
+  result.facts[0].evidence.push({ path: copy, note: result.facts[0].evidence[0].note });
+  const ids = store.submitWorker(id, result, directory, workspace);
+  store.applyVerdict(id, verdict(ids), ids);
+
+  const evidence = store.fact(ids[0]).evidence;
+  assert.deepEqual(evidence.map(item => item.source), [original, copy]);
+  assert.equal(new Set(evidence.map(item => item.sha256)).size, 1);
+  assert.equal(new Set(evidence.map(item => item.note)).size, 1);
+  assert.equal(store.evidenceStatus().facts[ids[0]], true);
+  fs.unlinkSync(copy);
+  assert.equal(store.evidenceStatus().facts[ids[0]], false);
+});
+
+for (const hasSubmission of [false, true]) {
+test(`${hasSubmission ? 'Submission-only' : 'Legacy'} evidence rows migrate without losing identity or currentness`, t => {
+  const env = fixture(t);
+  const directory = path.join(env.run, 'legacy-work'); fs.mkdirSync(directory);
+  const initial = new Store(env.run);
+  const taskID = initial.addTask(task('Legacy evidence'));
+  const ids = initial.submitWorker(taskID, workerResult(env.workspace), directory, env.workspace);
+  initial.applyVerdict(taskID, verdict(ids), ids);
+  if (hasSubmission) initial.db.prepare('UPDATE evidence SET submission=3').run();
+  initial.close();
+
+  const databasePath = path.join(env.run, 'ledger.sqlite');
+  const legacy = new DatabaseSync(databasePath);
+  legacy.exec(`
+    ALTER TABLE evidence RENAME TO evidence_with_submission;
+    CREATE TABLE evidence (
+      id INTEGER PRIMARY KEY, fact_id INTEGER NOT NULL REFERENCES facts(id),
+      task_id INTEGER NOT NULL REFERENCES tasks(id), ${hasSubmission ? 'submission INTEGER NOT NULL DEFAULT 1,' : ''} sha256 TEXT NOT NULL,
+      source TEXT NOT NULL, note TEXT NOT NULL, bytes INTEGER NOT NULL,
+      UNIQUE(fact_id, task_id, ${hasSubmission ? 'submission,' : ''} sha256, note)
+    );
+    INSERT INTO evidence(id,fact_id,task_id,${hasSubmission ? 'submission,' : ''}sha256,source,note,bytes)
+      SELECT id,fact_id,task_id,${hasSubmission ? 'submission,' : ''}sha256,source,note,bytes FROM evidence_with_submission;
+    DROP TABLE evidence_with_submission;
+  `);
+  legacy.close();
+
+  const migrated = new Store(env.run); env.dispose(() => migrated.close());
+  assert(migrated.db.prepare('PRAGMA table_info(evidence)').all().some(column => column.name === 'submission'));
+  assert.deepEqual(migrated.fact(ids[0]).evidence.map(item => item.submission), [hasSubmission ? 3 : 1]);
+  assert.equal(migrated.evidenceStatus().facts[ids[0]], true);
+  const uniqueIndex = migrated.db.prepare('PRAGMA index_list(evidence)').all().find(index => index.unique);
+  const columns = migrated.db.prepare(`PRAGMA index_info('${uniqueIndex.name}')`).all().map(column => column.name);
+  assert.deepEqual(columns, ['fact_id', 'task_id', 'submission', 'source', 'sha256', 'note']);
+});
+}
 
 test('failed dependencies become blocked and exact duplicate tasks are not queued', t => {
   const { store } = setup(t);

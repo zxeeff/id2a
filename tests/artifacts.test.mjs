@@ -63,11 +63,16 @@ test('new tasks added during final editing are executed before completion', asyn
   let editors = 0, engine;
   engine = new Engine(env.run, { providerFactory: scriptedFactory(message => {
     if (message.role === 'worker') return workerResult(env.workspace);
-    if (message.role === 'editor' && ++editors === 1) engine.store.addTask(task('User added task'));
+    if (message.role === 'editor' && ++editors === 1) {
+      assert.equal(engine.store.getMeta('goal:outcome'), 'pending');
+      engine.store.addTask(task('User added task'));
+    }
     return defaultResult(message);
   }) }); env.dispose(() => engine.close());
   assert.equal(await engine.run(), 'completed');
   assert.equal(editors, 2);
   assert.equal(engine.store.tasks().length, 2);
   assert(engine.store.tasks().every(item => item.state === 'accepted'));
+  assert.equal(engine.store.getMeta('goal:outcome'), 'achieved');
+  assert.equal(engine.store.events().filter(event => event.type === 'run.finished').length, 1);
 });

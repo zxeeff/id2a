@@ -76,7 +76,13 @@ Worker는 개발 목표에 필요한 원본 파일을 직접 편집하고 테스
 
 ## 지속형 목표 루프
 
-각 작업의 수정 횟수나 기술적 실패 횟수를 소진해도 run은 끝나지 않습니다. Goal 역할이 실제 workspace, 검증된 사실, 성공·실패 작업을 다시 확인해 다른 구현·수정·검증 작업을 생성합니다. `completed`는 Goal 역할이 원래 목표의 완료 조건을 확인한 뒤에만 기록됩니다.
+실행을 시작하기 전에 Contract 역할이 초기 프롬프트와 전체 추가 지시에서 목표 계약을 만듭니다. 계약은 원래 목표 전체를 보존하는 `G0`와 구체적인 결과·산출물·제약 조건으로 구성되며, 별도의 Contract Review가 원문과 대조해 누락이나 약화가 없는지 확인합니다. 계약이 승인된 뒤에만 Planner가 작업을 나눕니다. 이후 전체 지시가 추가되면 기존 계약을 덮어쓰지 않고 새 revision을 만들며, 이전 계약과 판정은 이력으로 남깁니다.
+
+각 작업의 수정 횟수나 기술적 실패 횟수를 소진해도 곧바로 목표 달성으로 끝나지 않습니다. Goal 역할은 현재 계약의 모든 조건을 `satisfied`, `unsatisfied`, `unknown` 중 하나로 평가하고, 충족 판정마다 현재 원본과 일치하는 검증 사실 ID를 연결합니다. 미달이면 실제 workspace, 검증된 사실, 성공·실패 작업을 다시 확인해 다른 구현·수정·검증 작업을 생성합니다. 모든 조건을 충족했다고 판단한 후보도 별도의 Goal Review가 다시 검토합니다.
+
+완료 후보를 확정하기 직전에 컨트롤러는 계약, 사실 원장, 증거 파일, 사용자 지시가 판정 시점과 같은지 CAS 방식으로 검사합니다. 그 사이 하나라도 바뀌면 결과를 저장하지 않고 새 상태에서 다시 판정합니다. 반복해도 새 진전이 없거나 설정된 판정·호출 한도를 소진하면 실행은 종료될 수 있지만, 이 경우 목표 결과는 성공이 아니라 `not_established`로 기록됩니다.
+
+실행 상태, 목표 결과, 종료 이유, 보고서 상태는 서로 다른 값입니다. 실행 상태 `completed`는 컨트롤러가 종결 기록까지 마쳤다는 뜻이며, 실제 목표 달성 여부는 `goal_outcome`의 `achieved` 또는 `not_established`로 확인해야 합니다. `termination`에는 `goal_achieved`, `budget_exhausted`, `no_progress` 같은 이유가 저장되고, `report`는 `not_started`, `generating`, `complete`, `failed`, `stale` 상태를 별도로 가집니다. 이전 형식의 완료 run은 근거 없이 성공으로 간주하지 않고 관련 상태를 `legacy_unknown`으로 표시합니다.
 
 기본 `--input-policy continue`에서는 사용자 응답을 기다리지 않습니다. 범위, 기준선, 파일 집합, 우선순위, 구현 세부사항, 검증 방법처럼 되돌릴 수 있는 선택은 가장 안전하고 제한적인 합리적 기본값을 스스로 채택하고 가정으로 기록합니다. Goal이 이런 선택에 `needs_input`을 반환해도 컨트롤러가 판정을 반려하고 실질 작업을 다시 계획시킵니다. 외부 자원이 없을 때도 가능한 우회, 대체 검증, 부분 구현을 계속 찾습니다.
 
@@ -132,7 +138,7 @@ C:\id2a\id2a.cmd resume latest --review-provider claude
 
 ## 모델과 effort
 
-새 Codex 실행의 기본 모델은 요청한 `gpt-5.6-sol`로 고정했습니다. 기본 effort는 `xhigh`, 독립 Codex Supervisor의 기본 effort는 `max`입니다. 역할별 명시 설정이 없으면 Planner·Worker·Triage·Goal·Curator·Editor는 `xhigh`를 사용합니다. 새 run 기본값은 전역 Codex/Claude 설정이나 기존 run의 저장 설정을 자동으로 변경하지 않습니다.
+새 Codex 실행의 기본 모델은 요청한 `gpt-5.6-sol`로 고정했습니다. 기본 effort는 `xhigh`, 독립 Codex Supervisor의 기본 effort는 `max`입니다. 역할별 명시 설정이 없으면 Planner·Worker·Triage·Goal·Curator·Editor는 `xhigh`를 사용합니다. Contract는 Planner 설정을, Contract Review와 Goal Review는 Supervisor 설정을 상속합니다. 새 run 기본값은 전역 Codex/Claude 설정이나 기존 run의 저장 설정을 자동으로 변경하지 않습니다.
 
 `xhigh`는 사용자가 선택한 기본값이며 이 작업에서 effort별 품질을 비교한 벤치마크 결과는 아닙니다. [공식 OpenAI 추론 지침](https://developers.openai.com/api/docs/guides/reasoning)은 `xhigh`의 사용 예로 깊은 연구와 보안·코드 검토를 들지만, 추가 시간·사용량을 정당화하는 품질 개선을 확인하도록 안내합니다. 반복 정리 비용이 부담되면 `/effort curator medium`이나 역할별 설정으로 낮출 수 있습니다. `max`가 항상 더 낫다는 보장은 없으며, 프롬프트가 길다는 이유만으로 최고 effort가 필요한 것은 아닙니다.
 
@@ -154,19 +160,22 @@ C:\id2a\id2a.cmd doctor --provider codex --models
 
 지원하는 Codex effort는 `model/list`의 모델별 목록과 대조합니다. 목록에 나타나는 모델이 실제 계정에서 실행 가능한지는 실행 성공으로 확인해야 합니다. Claude CLI에는 `low`, `medium`, `high`, `xhigh`, `max`를 전달할 수 있으며 모델에 따른 지원 여부는 CLI가 확인합니다.
 
-모든 역할의 모델을 하나로 고정하지 않아도 됩니다. `examples/config.json`을 복사하여 `roleSettings`의 `planner`, `worker`, `supervisor`, `triage`, `goal`, `curator`, `editor`마다 `provider`, `model`, `effort`를 설정하고 `--config`로 전달하세요. 명령행 옵션이 설정 파일보다 우선합니다. `--model`은 기본 provider의 모델이며 교차 검토 모델은 `--review-model`로 지정합니다.
+모든 역할의 모델을 하나로 고정하지 않아도 됩니다. `examples/config.json`을 복사하여 `roleSettings`의 `contract`, `contract_review`, `planner`, `worker`, `supervisor`, `triage`, `goal`, `goal_review`, `curator`, `editor`마다 `provider`, `model`, `effort`를 설정하고 `--config`로 전달하세요. `contract`의 직접 설정은 상속한 `planner` 설정보다 우선하고, `contract_review`와 `goal_review`의 직접 설정은 상속한 `supervisor` 설정보다 우선합니다. 명령행 옵션이 설정 파일보다 우선합니다. `--model`은 기본 provider의 모델이며 `--review-provider`, `--review-model`, `--review-effort`는 Supervisor와 이를 상속하는 두 독립 검토 역할의 기본값을 지정합니다.
 
 ## 사실 교환과 검증
 
-1. Planner가 최초 프롬프트를 최대 8개 초기 작업으로 나눕니다. 선행 작업은 앞선 작업만 참조할 수 있습니다.
-2. Worker가 프로젝트를 구현·수정하고 관련 테스트를 실행한 뒤 최종 JSON으로 사실, 파생 파일, 후속 작업 제안을 제출합니다.
-3. 컨트롤러가 형식, 파일 경로, 존재 여부와 크기를 확인합니다. 증거 파일을 SHA-256 이름의 사본으로 보관합니다. 파일이 있다는 것만으로 주장을 검증 상태로 만들지는 않습니다.
-4. Supervisor가 새 세션에서 실제 증거 내용을 확인하고 모든 제출 사실을 정확히 한 번 판정합니다.
-5. 검증된 사실이 기본 컨텍스트에 포함됩니다. 같은 key/같은 주장은 중복 저장하지 않고 출처를 추가합니다. 다른 검증된 주장이 같은 key를 쓰면 충돌을 표시하고 별도 검토 작업을 만듭니다.
-6. 후속 작업은 Triage가 승인해야 대기열에 들어가며 중복은 제거합니다.
-7. Curator는 범위별 미처리 사실을 입력 예산에 맞춰 나누어 요약합니다. 전달 시도한 ID, 저장에 성공한 배치의 입력 ID, 실제 digest에 연결된 ID를 구분합니다. 실패한 배치는 다음 호출에서 재시도하며, digest와 성공 기록은 한 트랜잭션으로 저장합니다. 요약의 근거 사실이 반박되거나 충돌 상태가 되면 해당 요약을 컨텍스트에서 제외합니다.
-8. Goal이 원래 목표가 실제로 충족됐는지 독립 판정합니다. 미달이면 다음 작업 사이클을 만들고, 작업 실패나 수정 상한만으로 종료하지 않습니다.
-9. 완료 판정 뒤에만 Editor가 검증된 사실, 작업 이력, 목표 판정을 바탕으로 최종 보고서를 작성하고 `completed`를 기록합니다.
+1. Contract가 초기 프롬프트와 전체 추가 지시에서 목표 계약 후보를 만들고, 컨트롤러가 원문 전체를 나타내는 `G0` 조건을 추가합니다.
+2. Contract Review가 각 조건을 원문과 대조합니다. 모든 조건이 `covered`이고 누락이 없을 때만 계약 revision을 확정합니다.
+3. Planner가 승인된 목표 계약을 최대 8개 초기 작업으로 나눕니다. 선행 작업은 앞선 작업만 참조할 수 있습니다.
+4. Worker가 프로젝트를 구현·수정하고 관련 테스트를 실행한 뒤 최종 JSON으로 사실, 파생 파일, 후속 작업 제안을 제출합니다.
+5. 컨트롤러가 형식, 파일 경로, 존재 여부와 크기를 확인합니다. 증거 파일을 SHA-256 이름의 사본으로 보관합니다. 파일이 있다는 것만으로 주장을 검증 상태로 만들지는 않습니다.
+6. Supervisor가 새 세션에서 실제 증거 내용을 확인하고 모든 제출 사실을 정확히 한 번 판정합니다.
+7. 검증된 사실이 기본 컨텍스트에 포함됩니다. 같은 key/같은 주장은 중복 저장하지 않고 출처를 추가합니다. 다른 검증된 주장이 같은 key를 쓰면 충돌을 표시하고 별도 검토 작업을 만듭니다.
+8. 후속 작업은 Triage가 승인해야 대기열에 들어가며 중복은 제거합니다.
+9. Curator는 범위별 미처리 사실을 입력 예산에 맞춰 나누어 요약합니다. 전달 시도한 ID, 저장에 성공한 배치의 입력 ID, 실제 digest에 연결된 ID를 구분합니다. 실패한 배치는 다음 호출에서 재시도하며, digest와 성공 기록은 한 트랜잭션으로 저장합니다. 요약의 근거 사실이 반박되거나 충돌 상태가 되면 해당 요약을 컨텍스트에서 제외합니다.
+10. Goal이 계약의 모든 조건을 개별 판정합니다. 미달이면 다음 작업 사이클을 만들고, 작업 실패나 수정 상한만으로 달성을 선언하지 않습니다.
+11. Goal이 `achieved` 후보를 만들면 Goal Review가 같은 계약과 현재 증거를 독립적으로 검사합니다. 하나라도 거절하면 다시 작업 또는 판정 단계로 돌아갑니다.
+12. Editor가 검증된 사실, 작업 이력, 목표 판정을 바탕으로 보고서 후보를 만들고, 컨트롤러가 계약·원장·증거·지시의 동일성과 조건별 근거를 한 트랜잭션에서 다시 검사합니다. CAS가 통과한 결과만 `achieved` 또는 `not_established` 목표 결과와 함께 확정됩니다.
 
 사실은 `proposed`, `verified`, `refuted`, `conflicted`, `superseded` 상태를 갖습니다. 서로 다른 문구가 같은 의미라는 점을 별도의 충돌 검토에서 확인하면 대표 주장을 남기고 나머지를 `superseded`로 표시합니다. 이 경우 참인 주장을 `refuted`로 기록하지 않습니다. `verified`는 해당 증거에 대한 독립 LLM 검토를 통과했다는 뜻입니다. 수학적 증명이나 실제 프로그램 실행에 대한 보증은 아닙니다. 관찰뿐 아니라 파일 근거가 있는 `dead_end`도 같은 검토 절차를 거쳐 저장합니다.
 
@@ -188,7 +197,7 @@ Goal·Editor는 최초 프롬프트에 없었더라도 조회한 현재 검증 �
 run.json                  실행 설정과 자료 폴더/Git revision
 prompt.txt                초기 프롬프트 원문
 plan.json                 승인된 초기 계획
-ledger.sqlite             작업, 사실, 증거 참조, 지시, 판정, 세션 기록
+ledger.sqlite             목표 계약, 작업, 사실, 증거 참조, 지시, 판정, 세션 기록
 events.jsonl              컨트롤러 이벤트
 artifacts/<sha256>.blob    원본 증거 사본
 tasks/T1/outputs/          작업자가 제출한 파생 텍스트 파일
@@ -198,12 +207,14 @@ attempts/1/raw.jsonl       원본 CLI 프로토콜 이벤트
 attempts/1/stream.jsonl    텍스트 델타와 진행 이벤트
 attempts/1/result.json    해당 역할의 구조화된 결과
 report.md                 최종 보고서와 증거 색인
-result.json               전체 작업/검증 사실/충돌/보고서
+result.json               실행 상태, 목표 결과, 계약, 조건별 판정, 작업/사실/충돌/보고서
 ```
 
 `export`는 모든 사실 상태와 증거 참조를 `snapshot.json`에 내보냅니다. DB와 증거 파일을 함께 보관해야 완전한 기록이 됩니다. 원본 CLI 로그에는 작업 프롬프트와 파일 내용이 포함될 수 있습니다.
 
-기본 동시 작업 수는 2, 한 초기 계획 또는 목표 재계획 사이클의 작업 제안 상한은 8, 수정 요청은 작업당 최대 2회, 역할 실행 시간은 최대 1,200초입니다. `--workers`, `--max-tasks`, `--max-revisions`, `--timeout`으로 변경할 수 있습니다. 작업별 기술적 실패는 최대 2회 후 `stalled`로 남지만, run은 Goal이 다른 접근을 만들며 계속됩니다. `pause`는 새 배정 중지이며, 미완료 종료는 사용자의 `stop`입니다. 한 run에는 컨트롤러 하나만 실행할 수 있습니다.
+기본 동시 작업 수는 2, 한 초기 계획 또는 목표 재계획 사이클의 작업 제안 상한은 8, 수정 요청은 작업당 최대 2회, 역할 실행 시간은 최대 1,200초입니다. Goal 판정은 기본 12회, 같은 조건 판정과 이미 본 근거만 반복하는 무진전은 기본 3회, 계약·계획·목표 판정 같은 제어 단계의 연속 실패는 기본 5회까지 허용합니다. 전체 provider 호출은 run당 기본 100회이며 그중 1회를 최종 보고서 Editor용으로 예약합니다. 이 회수와 실패 기록은 원장에 저장되므로 `resume`해도 새로 시작하지 않습니다.
+
+각 값은 `--workers`, `--max-tasks`, `--max-revisions`, `--timeout`, `--max-goal-rounds`, `--max-no-progress`, `--max-control-failures`, `--max-attempts` 또는 대응하는 camelCase 설정 파일 필드로 변경할 수 있습니다. 한도를 소진하면 가능한 경우 현재 계약의 각 조건을 `unknown` 또는 `unsatisfied`로 남기고 목표 결과 `not_established`와 종료 이유 `budget_exhausted`를 기록합니다. 작업별 기술적 실패는 최대 2회 후 `stalled`로 남지만, 전체 한도 안에서는 Goal이 다른 접근을 만들 수 있습니다. `pause`는 새 배정 중지이며, 명시적인 중단은 사용자의 `stop`입니다. 한 run에는 컨트롤러 하나만 실행할 수 있습니다.
 
 Worker의 파생 파일은 작업당 최대 16개, 파일당 UTF-8 512KB, 합계 2MB입니다. 증거는 파일당 64MB 이하이며 해당 작업 폴더 또는 자료 폴더 안에 있어야 합니다. 디렉터리 이탈, 드라이브 경로, Windows 특수 파일명, 출력 링크를 통한 바깥 폴더 덮어쓰기를 거부합니다.
 

@@ -39,6 +39,15 @@ export function scriptedFactory(handler) {
   });
 }
 export function defaultResult({ role, data }) {
+  if (role === 'contract') return {
+    objective: data.goal.trim().slice(0, 300),
+    requirements: [{ type: 'outcome', statement: 'Complete the requested result.',
+      source_reference: data.goal.trim().slice(0, 120), verification: 'Verify the requested result against current evidence.' }],
+  };
+  if (role === 'contract_review') return {
+    decision: 'accept', reason: 'The contract preserves the request.', missing_requirements: [],
+    requirement_reviews: data.proposal.requirements.map(item => ({ requirement_id: item.id, verdict: 'covered', reason: 'Covered by the contract.' })),
+  };
   if (role === 'planner') return { summary: 'Check notes', tasks: [{ ...task(), depends_on: [] }] };
   if (role === 'worker') throw new Error('Worker fixture needs an explicit workspace.');
   if (role === 'supervisor') {
@@ -46,12 +55,18 @@ export function defaultResult({ role, data }) {
     return verdict(data.facts.map(fact => fact.id));
   }
   if (role === 'goal') return {
-    decision: 'complete',
+    decision: 'achieved',
+    contract_revision: data.contract.revision,
+    requirement_evaluations: data.contract.requirements.map(requirement => ({ requirement_id: requirement.id,
+      verdict: 'satisfied', fact_ids: data.facts.map(fact => fact.id), reason: 'Current verified evidence establishes this requirement.' })),
     reason: 'All requested work is accepted and independently verified.',
     progress: 'The requested project result is present.',
-    fact_ids: data.facts.map(fact => fact.id),
     next_tasks: [],
     question: '',
+  };
+  if (role === 'goal_review') return {
+    decision: 'accept', contract_revision: data.contract.revision, reason: 'Every requirement is established by current evidence.',
+    requirement_reviews: data.contract.requirements.map(requirement => ({ requirement_id: requirement.id, verdict: 'accept', reason: 'The cited evidence is relevant.' })),
   };
   if (role === 'curator') return { scope: 'docs.runtime', summary: 'The notes require Node.js 24 or newer.', fact_ids: data.facts.map(fact => fact.id) };
   if (role === 'editor') return { title: 'Result', body: 'See confirmed facts.', fact_ids: data.facts.map(fact => fact.id) };

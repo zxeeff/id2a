@@ -13,7 +13,7 @@ function dataFrom(prompt) {
 }
 
 test('prompts keep the workflow contract concise and role-specific', () => {
-  const roles = ['planner', 'worker', 'supervisor', 'triage', 'goal', 'curator', 'editor'];
+  const roles = ['contract', 'contract_review', 'planner', 'worker', 'supervisor', 'triage', 'goal', 'goal_review', 'curator', 'editor'];
   for (const role of roles) {
     const prompt = makePrompt(role, base);
     assert.match(prompt, new RegExp(`^Role: ${role}$`, 'mu'));
@@ -28,7 +28,10 @@ test('prompts keep the workflow contract concise and role-specific', () => {
   assert.match(makePrompt('worker', base), /outputs\/<path> evidence/u);
   assert.match(makePrompt('worker', base), /never write artifact files with tools/u);
   assert.match(makePrompt('supervisor', base), /evidence_read/u);
-  assert.match(makePrompt('goal', base), /completion gate/u);
+  assert.match(makePrompt('contract', base), /goal contract/u);
+  assert.match(makePrompt('contract_review', base), /Independently compare/u);
+  assert.match(makePrompt('goal', base), /fixed goal contract/u);
+  assert.match(makePrompt('goal_review', base), /Independently audit/u);
   assert.match(makePrompt('curator', base), /Copy context\.scope verbatim/u);
 });
 

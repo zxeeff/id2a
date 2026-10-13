@@ -165,6 +165,7 @@ test('Goal and Editor receive coverage and digests and may cite omitted verified
   const env = fixture(t, { contextCharacters: 4000 });
   const seen = new Set(); let ids;
   const engine = new Engine(env.run, { providerFactory: scriptedFactory(message => {
+    if (['contract', 'contract_review', 'goal_review'].includes(message.role)) return defaultResult(message);
     assert(['goal', 'editor'].includes(message.role));
     seen.add(message.role);
     assert.equal(message.data.context.coverage.facts.total, ids.length);
@@ -174,13 +175,18 @@ test('Goal and Editor receive coverage and digests and may cite omitted verified
     assert(!message.data.facts.some(fact => fact.id === ids[0]));
     const page = engine.store.ledgerPage({ collection: 'facts', snapshot: message.data.context.snapshot, limit: 1 });
     assert.equal(page.items[0].id, ids[0]);
-    return { ...defaultResult(message), fact_ids: [ids[0]] };
+    const result = defaultResult(message);
+    if (message.role === 'goal') result.requirement_evaluations = result.requirement_evaluations
+      .map(item => ({ ...item, fact_ids: [ids[0]] }));
+    else result.fact_ids = [ids[0]];
+    return result;
   }) }); env.dispose(() => engine.close());
   ids = seed(engine.store, env, 5, 600);
   engine.store.addDigest({ scope: 'docs.runtime', summary: 'Runtime observations', fact_ids: ids });
+  await engine.ensureGoalContract();
   const outcome = await engine.assessGoal();
-  assert.equal(outcome.kind, 'complete');
-  assert.equal(await engine.report(outcome.assessment), 'completed');
+  assert.equal(outcome.kind, 'achieved');
+  assert.equal(await engine.report(outcome), 'completed');
   assert.deepEqual([...seen], ['goal', 'editor']);
 });
 
@@ -188,10 +194,14 @@ test('Goal rejects invented IDs and discards a decision if fact states change du
   const env = fixture(t);
   let mode = 'invented'; let ids;
   const engine = new Engine(env.run, { providerFactory: scriptedFactory(message => {
-    if (mode === 'changed') engine.store.db.prepare("UPDATE facts SET state='refuted' WHERE id=?").run(ids[0]);
-    return { ...defaultResult(message), fact_ids: mode === 'invented' ? [9999] : [ids[0]] };
+    if (message.role === 'goal' && mode === 'changed') engine.store.db.prepare("UPDATE facts SET state='refuted' WHERE id=?").run(ids[0]);
+    const result = defaultResult(message);
+    if (message.role === 'goal') result.requirement_evaluations = result.requirement_evaluations
+      .map(item => ({ ...item, fact_ids: mode === 'invented' ? [9999] : [ids[0]] }));
+    return result;
   }) }); env.dispose(() => engine.close());
   ids = seed(engine.store, env, 1);
+  await engine.ensureGoalContract();
   await assert.rejects(engine.assessGoal(), /검증되지 않은/u);
   mode = 'changed';
   assert.equal((await engine.assessGoal()).kind, 'changed');
@@ -212,4 +222,82 @@ test('task coverage exposes omissions and prioritizes work that is not accepted'
   assert(view.compactTasks.some(item => item.id === pending));
   const page = engine.store.ledgerPage({ collection: 'tasks', snapshot: view.snapshot, state: 'queued' });
   assert.deepEqual(page.items.map(item => item.id), [pending]);
+});
+
+test('completion validation rejects missing criteria and evidence made stale by source changes', async t => {
+  const env = fixture(t);
+  const engine = new Engine(env.run, { providerFactory: scriptedFactory(defaultResult) }); env.dispose(() => engine.close());
+  const ids = seed(engine.store, env, 1);
+  const contract = await engine.ensureGoalContract();
+  const view = engine.goalContext();
+  const valid = defaultResult({ role: 'goal', data: { contract, facts: view.compactFacts } });
+  assert.throws(() => engine.validateGoalAssessment({ ...valid, requirement_evaluations: valid.requirement_evaluations.slice(1) }, contract, view), /모든 필수 조건/u);
+  const candidate = engine.completionCandidate(view, contract);
+  const unreviewed = { ...valid, round: 1, at: new Date().toISOString(), independent_review: {
+    decision: 'reject', contract_revision: contract.revision, reason: 'Not independently established.',
+    requirement_reviews: contract.requirements.map(item => ({ requirement_id: item.id, verdict: 'reject', reason: 'Insufficient.' })),
+  } };
+  assert.throws(() => engine.store.commitGoalOutcome(candidate, { outcome: 'achieved',
+    termination: { reason: 'goal_achieved' }, assessment: unreviewed, report: { state: 'generating' } }), /독립 완료 검토/u);
+  fs.writeFileSync(path.join(env.workspace, 'notes.txt'), 'The source changed after verification.\n', 'utf8');
+  const staleView = engine.goalContext();
+  assert.equal(staleView.currentFactIDs.has(ids[0]), false);
+  assert.throws(() => engine.validateGoalAssessment(valid, contract, staleView), /오래된 사실/u);
+});
+
+test('stored contracts are revalidated and corrupt requirement sets cannot be committed', async t => {
+  const env = fixture(t);
+  const engine = new Engine(env.run, { providerFactory: scriptedFactory(defaultResult) }); env.dispose(() => engine.close());
+  const valid = await engine.ensureGoalContract();
+  const empty = { ...valid, requirements: [], review: { decision: 'accept', reason: 'Invalid empty review.',
+    missing_requirements: [], requirement_reviews: [] } };
+  engine.store.setMeta('goal:contract', empty);
+  assert.throws(() => engine.validateStoredContract(empty), /계약/u);
+  const missingAnchor = { ...valid, requirements: valid.requirements.slice(1), review: { ...valid.review,
+    requirement_reviews: valid.review.requirement_reviews.slice(1) } };
+  assert.throws(() => engine.validateStoredContract(missingAnchor), /계약/u);
+  const duplicate = structuredClone(valid);
+  duplicate.requirements[1].id = 'G0';
+  duplicate.review.requirement_reviews[1].requirement_id = 'G0';
+  assert.throws(() => engine.validateStoredContract(duplicate), /계약/u);
+  const alteredAnchor = structuredClone(valid);
+  alteredAnchor.requirements[0].statement = 'A weaker replacement goal.';
+  assert.throws(() => engine.validateStoredContract(alteredAnchor), /계약/u);
+  const inventedSource = structuredClone(valid);
+  inventedSource.requirements[1].source_reference = 'text that never appeared in the user request';
+  assert.throws(() => engine.validateStoredContract(inventedSource), /계약/u);
+
+  const view = engine.goalContext();
+  const candidate = engine.completionCandidate(view, empty);
+  const emptyAssessment = { decision: 'achieved', contract_revision: empty.revision,
+    requirement_evaluations: [], reason: 'Invalid.', progress: '', next_tasks: [], question: '',
+    independent_review: { decision: 'accept', contract_revision: empty.revision, reason: 'Invalid.', requirement_reviews: [] } };
+  assert.throws(() => engine.store.commitGoalOutcome(candidate, { outcome: 'achieved',
+    termination: { reason: 'goal_achieved' }, assessment: emptyAssessment, report: { state: 'generating' } }), /계약/u);
+
+  const regenerated = await engine.ensureGoalContract();
+  assert.equal(regenerated.revision, valid.revision + 1);
+  assert.deepEqual(regenerated.requirements.map(item => item.id), ['G0', 'R1']);
+});
+
+test('later global instructions create a new immutable contract revision', async t => {
+  const env = fixture(t);
+  const engine = new Engine(env.run, { providerFactory: scriptedFactory(defaultResult) }); env.dispose(() => engine.close());
+  const first = await engine.ensureGoalContract();
+  const priorAssessment = { contract_revision: first.revision, decision: 'continue', marker: 'assessment-one' };
+  const priorProgress = { signature: 'prior', stagnant: 2, round: 4 };
+  engine.store.setMeta('goal:assessment', priorAssessment);
+  engine.store.setMeta('goal:progress', priorProgress);
+  engine.store.setMeta('goal:round', 4);
+  engine.store.message('추가 결과 형식을 함께 제공하세요.');
+  const second = await engine.ensureGoalContract();
+  assert.equal(first.revision, 1);
+  assert.equal(second.revision, 2);
+  assert.equal(engine.store.getMeta('goal:contract:1').revision, 1);
+  assert.notEqual(first.source.fingerprint, second.source.fingerprint);
+  assert.equal(engine.store.getMeta('goal:outcome'), 'pending');
+  assert.deepEqual(engine.store.getMeta('goal:assessment:1'), priorAssessment);
+  assert.deepEqual(engine.store.getMeta('goal:progress:1'), priorProgress);
+  assert.equal(engine.store.getMeta('goal:round'), 4);
+  assert.equal(engine.store.getMeta('goal:progress'), null);
 });

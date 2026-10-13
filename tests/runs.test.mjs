@@ -65,7 +65,10 @@ test('CLI scopes list and latest commands to cwd while --global and explicit IDs
 
   const localStatus = invoke(['status', 'latest', '--runs-root', env.runs, '--json'], env.workspaceA);
   assert.equal(localStatus.status, 0, localStatus.stderr);
-  assert.equal(JSON.parse(localStatus.stdout).state, 'latest-a');
+  const localStatusJSON = JSON.parse(localStatus.stdout);
+  assert.equal(localStatusJSON.state, 'latest-a');
+  assert.equal(localStatusJSON.format_version, 3);
+  assert.equal(localStatusJSON.goal_format_version, 1);
 
   const globalStatus = invoke(['status', 'latest', '--runs-root', env.runs, '--global', '--json'], env.workspaceA);
   assert.equal(globalStatus.status, 0, globalStatus.stderr);
@@ -78,4 +81,30 @@ test('CLI scopes list and latest commands to cwd while --global and explicit IDs
   const missing = invoke(['status', 'latest', '--runs-root', env.runs], env.workspaceEmpty);
   assert.equal(missing.status, 1);
   assert.match(missing.stderr, /--global/u);
+});
+
+test('legacy completed runs are not inferred to have achieved their goal', t => {
+  const env = runFixture(t);
+  const store = new Store(env.latestA);
+  try {
+    store.setMeta('state', 'completed');
+    store.db.prepare("DELETE FROM meta WHERE key IN ('goal:format_version','goal:outcome','run:termination','report:status')").run();
+    const completion = store.completionStatus();
+    assert.equal(completion.format_version, 3);
+    assert.equal(completion.goal_format_version, 0);
+    assert.equal(completion.execution_state, 'completed');
+    assert.equal(completion.goal_outcome, 'legacy_unknown');
+    assert.equal(completion.termination.reason, 'legacy_unknown');
+  } finally { store.close(); }
+});
+
+test('legacy run.finished events render explicit unknown goal fields', t => {
+  const env = runFixture(t);
+  const store = new Store(env.latestA);
+  try { store.event('run.finished', { state: 'completed', report: 'legacy-report.md' }); }
+  finally { store.close(); }
+  const logs = invoke(['logs', path.basename(env.latestA), '--runs-root', env.runs], env.workspaceA);
+  assert.equal(logs.status, 0, logs.stderr);
+  assert.match(logs.stdout, /legacy_unknown/u);
+  assert.match(logs.stdout, /legacy-report\.md/u);
 });

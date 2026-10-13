@@ -7,8 +7,13 @@
   "effort": "xhigh",
   "maxTasks": 8,
   "maxRevisions": 2,
+  "maxGoalRounds": 12,
+  "maxNoProgress": 3,
+  "maxControlFailures": 5,
+  "maxAttempts": 100,
   "timeout": 1200,
   "roleSettings": {
+    "planner": { "effort": "xhigh" },
     "supervisor": { "provider": "claude", "effort": "auto" },
     "curator": { "effort": "xhigh" },
     "editor": { "effort": "xhigh" }
