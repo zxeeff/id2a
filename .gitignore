@@ -1,0 +1,45 @@
+# Run-local databases, evidence, prompts, and provider state
+/.id2a/
+/runs/
+/runs-*/
+/.protocol-cache/
+.id2a-mcp.json
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+
+# Machine-specific verification output (keep the test and smoke scripts)
+/*-verification.json
+/VERIFICATION.md
+
+# Dependencies, generated output, and logs
+node_modules/
+/dist/
+/coverage/
+/.nyc_output/
+/tmp/
+/temp/
+*.log
+npm-debug.log*
+
+# Local environment, credentials, and per-machine configuration
+.env
+.env.*
+!.env.example
+!.env.template
+/config.local.json
+/.aws/
+/.codex/
+/.claude/
+/.secrets/
+
+# Editor and operating-system files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini

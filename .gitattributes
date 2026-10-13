@@ -1,0 +1,6 @@
+* text=auto eol=lf
+
+# Keep Windows launchers and the PowerShell installer native on checkout.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf

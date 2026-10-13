@@ -1,0 +1,16 @@
+{
+  "provider": "codex",
+  "workers": 2,
+  "permissions": "yolo",
+  "inputPolicy": "continue",
+  "model": "gpt-5.6-sol",
+  "effort": "xhigh",
+  "maxTasks": 8,
+  "maxRevisions": 2,
+  "timeout": 1200,
+  "roleSettings": {
+    "supervisor": { "provider": "claude", "effort": "auto" },
+    "curator": { "effort": "xhigh" },
+    "editor": { "effort": "xhigh" }
+  }
+}

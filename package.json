@@ -1,0 +1,14 @@
+{
+  "name": "id2a",
+  "version": "0.2.2",
+  "private": true,
+  "type": "module",
+  "description": "Durable local development agents with an evidence-backed goal loop",
+  "engines": { "node": ">=24.0.0" },
+  "bin": { "id2a": "src/cli.mjs" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/cli.mjs",
+    "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.mjs",
+    "smoke:permissions": "node --disable-warning=ExperimentalWarning scripts/smoke-permissions.mjs"
+  }
+}

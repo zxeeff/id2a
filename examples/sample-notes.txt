@@ -1,0 +1,4 @@
+Project notes
+The project uses Node.js 24 or newer.
+The test command is npm test.
+Release notes must list changed public commands.
