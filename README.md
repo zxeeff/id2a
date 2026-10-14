@@ -80,9 +80,9 @@ Worker는 개발 목표에 필요한 원본 파일을 직접 편집하고 테스
 
 각 작업의 수정 횟수나 기술적 실패 횟수를 소진해도 곧바로 목표 달성으로 끝나지 않습니다. Goal 역할은 현재 계약의 모든 조건을 `satisfied`, `unsatisfied`, `unknown` 중 하나로 평가하고, 충족 판정마다 현재 원본과 일치하는 검증 사실 ID를 연결합니다. 미달이면 실제 workspace, 검증된 사실, 성공·실패 작업을 다시 확인해 다른 구현·수정·검증 작업을 생성합니다. 모든 조건을 충족했다고 판단한 후보도 별도의 Goal Review가 다시 검토합니다.
 
-완료 후보를 확정하기 직전에 컨트롤러는 계약, 사실 원장, 증거 파일, 사용자 지시가 판정 시점과 같은지 CAS 방식으로 검사합니다. 그 사이 하나라도 바뀌면 결과를 저장하지 않고 새 상태에서 다시 판정합니다. 반복해도 새 진전이 없거나 설정된 판정·호출 한도를 소진하면 실행은 종료될 수 있지만, 이 경우 목표 결과는 성공이 아니라 `not_established`로 기록됩니다.
+완료 후보를 확정하기 직전에 컨트롤러는 계약, 사실 원장, 증거 파일, 사용자 지시가 판정 시점과 같은지 CAS 방식으로 검사합니다. 그 사이 하나라도 바뀌면 결과를 저장하지 않고 새 상태에서 다시 판정합니다. 반복해도 새 진전이 없거나 한 실행 구간의 판정·호출 한도를 소진하면 `suspended` 체크포인트를 남깁니다. 이 상태는 완료가 아니며, 같은 설정으로 `resume`하면 원장과 작업을 보존한 채 새 실행 구간에서 계속합니다.
 
-실행 상태, 목표 결과, 종료 이유, 보고서 상태는 서로 다른 값입니다. 실행 상태 `completed`는 컨트롤러가 종결 기록까지 마쳤다는 뜻이며, 실제 목표 달성 여부는 `goal_outcome`의 `achieved` 또는 `not_established`로 확인해야 합니다. `termination`에는 `goal_achieved`, `budget_exhausted`, `no_progress` 같은 이유가 저장되고, `report`는 `not_started`, `generating`, `complete`, `failed`, `stale` 상태를 별도로 가집니다. 이전 형식의 완료 run은 근거 없이 성공으로 간주하지 않고 관련 상태를 `legacy_unknown`으로 표시합니다.
+실행 상태 `completed`는 `goal_outcome=achieved`일 때만 기록됩니다. 목표가 입증되지 않은 체크포인트는 `suspended/not_established`이며, `termination`에는 `segment_budget_exhausted`, `goal_round_limit`, `no_progress` 같은 이유가 저장됩니다. `report`의 `complete`는 최종 보고서 또는 진행 보고서 파일이 정상적으로 작성됐다는 뜻일 뿐 목표 달성을 뜻하지 않습니다. 이전 v3의 `completed/not_established` 기록은 읽을 때 `suspended`로 표시하고, 더 오래된 완료 run은 근거 없이 성공으로 간주하지 않고 `legacy_unknown`으로 표시합니다.
 
 기본 `--input-policy continue`에서는 사용자 응답을 기다리지 않습니다. 범위, 기준선, 파일 집합, 우선순위, 구현 세부사항, 검증 방법처럼 되돌릴 수 있는 선택은 가장 안전하고 제한적인 합리적 기본값을 스스로 채택하고 가정으로 기록합니다. Goal이 이런 선택에 `needs_input`을 반환해도 컨트롤러가 판정을 반려하고 실질 작업을 다시 계획시킵니다. 외부 자원이 없을 때도 가능한 우회, 대체 검증, 부분 구현을 계속 찾습니다.
 
@@ -206,15 +206,15 @@ attempts/1/schema.json     최종 출력 스키마
 attempts/1/raw.jsonl       원본 CLI 프로토콜 이벤트
 attempts/1/stream.jsonl    텍스트 델타와 진행 이벤트
 attempts/1/result.json    해당 역할의 구조화된 결과
-report.md                 최종 보고서와 증거 색인
+report.md                 최종 보고서 또는 진행 체크포인트와 증거 색인
 result.json               실행 상태, 목표 결과, 계약, 조건별 판정, 작업/사실/충돌/보고서
 ```
 
 `export`는 모든 사실 상태와 증거 참조를 `snapshot.json`에 내보냅니다. DB와 증거 파일을 함께 보관해야 완전한 기록이 됩니다. 원본 CLI 로그에는 작업 프롬프트와 파일 내용이 포함될 수 있습니다.
 
-기본 동시 작업 수는 2, 한 초기 계획 또는 목표 재계획 사이클의 작업 제안 상한은 8, 수정 요청은 작업당 최대 2회, 역할 실행 시간은 최대 1,200초입니다. Goal 판정은 기본 12회, 같은 조건 판정과 이미 본 근거만 반복하는 무진전은 기본 3회, 계약·계획·목표 판정 같은 제어 단계의 연속 실패는 기본 5회까지 허용합니다. 전체 provider 호출은 run당 기본 100회이며 그중 1회를 최종 보고서 Editor용으로 예약합니다. 이 회수와 실패 기록은 원장에 저장되므로 `resume`해도 새로 시작하지 않습니다.
+기본 동시 작업 수는 2, 한 초기 계획 또는 목표 재계획 사이클의 작업 제안 상한은 8, 수정 요청은 작업당 최대 2회, 역할 실행 시간은 최대 1,200초입니다. Goal 판정은 실행 구간당 기본 12회, 같은 조건 판정과 이미 본 근거만 반복하는 무진전은 기본 3회, 계약·계획·목표 판정 같은 제어 단계의 연속 실패는 기본 5회까지 허용합니다. provider 호출 한도는 실행 구간당 기본 100회입니다. 누적 호출·판정·실패 이력은 원장에 계속 남지만, 사용자가 명시적으로 `resume`하면 새 호출·Goal 구간이 시작됩니다.
 
-각 값은 `--workers`, `--max-tasks`, `--max-revisions`, `--timeout`, `--max-goal-rounds`, `--max-no-progress`, `--max-control-failures`, `--max-attempts` 또는 대응하는 camelCase 설정 파일 필드로 변경할 수 있습니다. 한도를 소진하면 가능한 경우 현재 계약의 각 조건을 `unknown` 또는 `unsatisfied`로 남기고 목표 결과 `not_established`와 종료 이유 `budget_exhausted`를 기록합니다. 작업별 기술적 실패는 최대 2회 후 `stalled`로 남지만, 전체 한도 안에서는 Goal이 다른 접근을 만들 수 있습니다. `pause`는 새 배정 중지이며, 명시적인 중단은 사용자의 `stop`입니다. 한 run에는 컨트롤러 하나만 실행할 수 있습니다.
+각 값은 `--workers`, `--max-tasks`, `--max-revisions`, `--timeout`, `--max-goal-rounds`, `--max-no-progress`, `--max-control-failures`, `--max-attempts` 또는 대응하는 camelCase 설정 파일 필드로 변경할 수 있습니다. 호출 한도에 도달하면 일반 작업보다 Goal 체크포인트를 우선하며, Goal을 실행하지 못한 경우 `assessment_status=assessment_not_run`을 명시합니다. 미달성 상태는 `suspended`로 남고 `resume`에서 실제 작업을 계속합니다. 무진전 재개는 과거 이력을 지우지 않으며 한 번의 다른 재계획 기회만 제공합니다. 작업별 기술적 실패는 최대 2회 후 `stalled`로 남습니다. `pause`는 새 배정 중지이며, 명시적인 중단은 사용자의 `stop`입니다. 한 run에는 컨트롤러 하나만 실행할 수 있습니다.
 
 Worker의 파생 파일은 작업당 최대 16개, 파일당 UTF-8 512KB, 합계 2MB입니다. 증거는 파일당 64MB 이하이며 해당 작업 폴더 또는 자료 폴더 안에 있어야 합니다. 디렉터리 이탈, 드라이브 경로, Windows 특수 파일명, 출력 링크를 통한 바깥 폴더 덮어쓰기를 거부합니다.
 

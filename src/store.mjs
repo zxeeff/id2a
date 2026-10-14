@@ -87,6 +87,10 @@ export class Store {
         COMMIT;
       `);
     }
+    if (this.getMeta('state') === 'completed' && this.getMeta('goal:outcome') === 'not_established') {
+      this.setMeta('state', 'suspended');
+      if (this.getMeta('control') === 'running') this.setMeta('control', 'paused');
+    }
     fs.mkdirSync(path.join(this.directory, 'artifacts'), { recursive: true });
   }
   close() { this.db.close(); }
@@ -115,10 +119,13 @@ export class Store {
     const explicitOutcome = this.getMeta('goal:outcome');
     const termination = this.getMeta('run:termination');
     const report = this.getMeta('report:status');
+    // Version 3 wrote resumable non-achievement checkpoints as completed. Keep
+    // the ledger intact while presenting those records with the v4 state model.
+    const executionState = state === 'completed' && explicitOutcome === 'not_established' ? 'suspended' : state;
     return {
-      format_version: 3,
+      format_version: 4,
       goal_format_version: this.getMeta('goal:format_version', 0),
-      execution_state: state,
+      execution_state: executionState,
       goal_outcome: explicitOutcome || (state === 'completed' ? 'legacy_unknown' : 'pending'),
       termination: termination || (state === 'completed' ? { reason: 'legacy_unknown' } : null),
       report: report || (fs.existsSync(path.join(this.directory, 'report.md')) ? { state: 'legacy_unknown' } : { state: 'not_started' }),
@@ -382,7 +389,8 @@ export class Store {
             || independent.requirement_reviews.some(item => item.verdict !== 'accept')) {
           throw new Error('현재 계약 전체를 승인한 독립 완료 검토가 필요합니다.');
         }
-      } else if (assessment?.decision !== 'concluded' || !['budget_exhausted', 'no_progress', 'external_blocker'].includes(termination?.reason)) {
+      } else if (assessment?.decision !== 'concluded'
+          || !['segment_budget_exhausted', 'goal_round_limit', 'no_progress', 'external_blocker', 'budget_exhausted'].includes(termination?.reason)) {
         throw new Error('미입증 종료에는 유효한 비성공 판정과 종료 이유가 필요합니다.');
       }
       this.setMeta('goal:assessment', assessment);
@@ -391,7 +399,8 @@ export class Store {
       this.setMeta('goal:outcome', outcome);
       this.setMeta('run:termination', termination);
       this.setMeta('report:status', report);
-      this.setMeta('state', 'completed');
+      this.setMeta('state', outcome === 'achieved' ? 'completed' : 'suspended');
+      if (outcome !== 'achieved') this.setMeta('control', 'paused');
       return true;
     });
     return committed;

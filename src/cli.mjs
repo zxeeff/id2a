@@ -57,6 +57,7 @@ start: 초기 프롬프트를 여러 줄로 붙여 넣고 마지막에 /end를 �
        --max-tasks 8  --max-revisions 2  --max-goal-rounds 12  --max-no-progress 3
        --max-control-failures 5  --max-attempts 100  --timeout 1200  --no-interactive  --json
        --max-tasks는 전체 종료 한도가 아니라 한 목표 사이클이 제안할 수 있는 작업 상한입니다.
+       호출·Goal 한도는 실행 구간 기준이며, suspended run을 resume하면 새 구간에서 계속합니다.
        --config config.json으로 역할별 provider/model/effort도 지정할 수 있습니다.
 
 latest와 list는 기본적으로 현재 폴더를 workspace로 사용하는 run만 찾습니다.
@@ -96,7 +97,8 @@ function summary(store) {
   for (const task of tasks) counts[task.state] = (counts[task.state] || 0) + 1;
   const completion = store.completionStatus();
   return { format_version: completion.format_version, goal_format_version: completion.goal_format_version,
-    state: completion.execution_state, control: store.getMeta('control'),
+    state: completion.execution_state,
+    control: completion.execution_state === 'suspended' ? 'paused' : store.getMeta('control'),
     goal_outcome: completion.goal_outcome, termination: completion.termination, report: completion.report,
     contract: store.getMeta('goal:contract'), goal: store.getMeta('goal:assessment'), counts,
     facts: store.listFacts({ limit: 500 }).map(({ id, key, state }) => ({ id, key, state })),
@@ -134,6 +136,7 @@ function renderEvent(event, rl) {
   else if (event.type === 'goal.waiting_input') console.log(`목표 진행에 외부 입력이 필요합니다: ${event.question}`);
   else if (event.type === 'goal.assessed') console.log(`[goal:${event.round}] ${event.decision}: ${event.reason.slice(0, 300)}`);
   else if (event.type === 'run.finished') console.log(`실행 종료: ${event.state} / 목표: ${event.goal_outcome} / 이유: ${event.termination_reason}\n보고서: ${event.report}`);
+  else if (event.type === 'run.suspended') console.log(`목표 미달성 — 실행 구간 중단: ${event.termination_reason}\n진행 보고서: ${event.report}\n계속하려면 이 run을 resume하세요.`);
   else console.log(`[${event.type}] ${JSON.stringify(event).slice(0, 420)}`);
   if (rl) rl.prompt(true);
 }

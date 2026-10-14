@@ -10,10 +10,11 @@ import { acquireLock, boundedJSON, hash, integer, now, readJSON, readText, sleep
 
 export const defaultRunsRoot = fileURLToPath(new URL('../runs/', import.meta.url));
 export const roles = ['contract', 'contract_review', 'planner', 'worker', 'supervisor', 'triage', 'goal', 'goal_review', 'curator', 'editor'];
+const nonAchievementReasons = new Set(['segment_budget_exhausted', 'goal_round_limit', 'no_progress', 'external_blocker', 'budget_exhausted']);
 
 class AttemptBudgetError extends Error {
   constructor(limit) {
-    super(`provider 호출 누적 상한(${limit})에 도달했습니다.`);
+    super(`이번 실행 구간의 provider 호출 상한(${limit})에 도달했습니다.`);
     this.name = 'AttemptBudgetError';
     this.code = 'ID2A_ATTEMPT_BUDGET';
   }
@@ -93,7 +94,7 @@ export function createRun(input, goal, root = defaultRunsRoot) {
   const directory = path.resolve(root, id);
   fs.mkdirSync(directory, { recursive: true });
   fs.writeFileSync(path.join(directory, 'prompt.txt'), goal, 'utf8');
-  writeJSON(path.join(directory, 'run.json'), { id, version: 3, created: now(), source: sourceIdentity(config.workspace), config });
+  writeJSON(path.join(directory, 'run.json'), { id, version: 4, created: now(), source: sourceIdentity(config.workspace), config });
   const store = new Store(directory);
   try {
     store.setMeta('state', 'created');
@@ -138,6 +139,10 @@ export class Engine {
     this.activeTasks = new Map();
     this.abortController = new AbortController();
     this.polling = false;
+    this.segmentStartAttempt = this.store.attemptCount();
+    this.segmentStartGoalRound = this.store.getMeta('goal:round', 0) || 0;
+    const previous = this.store.completionStatus();
+    this.noProgressResumeGrace = previous.execution_state === 'suspended' && previous.termination?.reason === 'no_progress';
   }
   settings(role) {
     const inheritedRole = ['contract_review', 'goal_review'].includes(role) ? 'supervisor' : role === 'contract' ? 'planner' : role;
@@ -177,11 +182,10 @@ export class Engine {
   async runAgent(role, task, data = {}) {
     const settings = this.settings(role);
     const taskID = task?.id || null;
-    // One call from the total persistent budget is reserved for final editing.
-    // A failed editor falls back to a controller report without another call.
-    const attempts = this.store.attemptCount();
-    const limit = role === 'editor' ? this.config.maxAttempts : this.config.maxAttempts - 1;
-    if (attempts >= limit) {
+    // Goal finalization and reporting remain available after the ordinary segment
+    // budget is spent so a long run cannot end without an explicit assessment.
+    const finalizationRole = ['contract', 'contract_review', 'goal', 'goal_review', 'editor'].includes(role);
+    if (!finalizationRole && this.attemptBudgetExhausted()) {
       throw new AttemptBudgetError(this.config.maxAttempts);
     }
     const attempt = this.store.beginAttempt(taskID, role, settings.provider);
@@ -558,11 +562,20 @@ export class Engine {
       && this.messageCutoff() === candidate.message_cutoff
       && hash(JSON.stringify(contract)) === candidate.contract_hash;
   }
+  attemptBudgetUsed() {
+    return Math.max(0, this.store.attemptCount() - this.segmentStartAttempt);
+  }
   attemptBudgetExhausted() {
-    return this.store.attemptCount() >= this.config.maxAttempts - 1;
+    return this.attemptBudgetUsed() >= this.config.maxAttempts;
+  }
+  goalRoundBudgetExhausted(round = this.store.getMeta('goal:round', 0) || 0) {
+    return Math.max(0, round - this.segmentStartGoalRound) >= this.config.maxGoalRounds;
   }
   reusableTerminalOutcome(status) {
-    if (status.execution_state !== 'completed' || !['achieved', 'not_established'].includes(status.goal_outcome)) return null;
+    if (!['completed', 'suspended'].includes(status.execution_state)
+        || !['achieved', 'not_established'].includes(status.goal_outcome)
+        || (status.goal_outcome === 'achieved' && status.execution_state !== 'completed')
+        || (status.goal_outcome === 'not_established' && status.execution_state !== 'suspended')) return null;
     const savedCandidate = this.store.getMeta('goal:candidate');
     const assessment = this.store.getMeta('goal:assessment');
     if (!savedCandidate || !assessment) return null;
@@ -580,7 +593,7 @@ export class Engine {
         this.validateGoalReview(assessment.independent_review, contract);
         return { kind: 'achieved', assessment, candidate };
       }
-      if (assessment.decision !== 'concluded' || !['budget_exhausted', 'no_progress', 'external_blocker'].includes(status.termination?.reason)) return null;
+      if (assessment.decision !== 'concluded' || !nonAchievementReasons.has(status.termination?.reason)) return null;
       return { kind: 'concluded', assessment, candidate, terminationReason: status.termination.reason };
     } catch { return null; }
   }
@@ -599,20 +612,14 @@ export class Engine {
       if (pending.kind === 'achieved') {
         this.validateGoalAssessment(pending.assessment, contract, view);
         this.validateGoalReview(pending.assessment.independent_review, contract);
-      } else if (pending.assessment.decision !== 'concluded'
-          || !['budget_exhausted', 'no_progress', 'external_blocker'].includes(pending.terminationReason)) return null;
+      } else if (pending.assessment.decision !== 'concluded' || !nonAchievementReasons.has(pending.terminationReason)) return null;
       return pending;
     } catch { return null; }
   }
   terminalLimitStillApplies(outcome) {
-    if (outcome.kind === 'achieved') return true;
-    if (outcome.terminationReason === 'budget_exhausted') {
-      return this.store.getMeta('goal:round', 0) >= this.config.maxGoalRounds || this.attemptBudgetExhausted();
-    }
-    if (outcome.terminationReason === 'no_progress') {
-      return (this.store.getMeta('goal:progress')?.stagnant || 0) >= this.config.maxNoProgress;
-    }
-    return true;
+    // A new Engine invocation is an explicit resume request and grants a fresh
+    // execution segment. Only an already approved achievement is terminal.
+    return outcome.kind === 'achieved';
   }
   completedReportIsCurrent(status) {
     if (status.report?.state !== 'complete' || !status.report.id) return false;
@@ -678,39 +685,79 @@ export class Engine {
     const contract = this.validateStoredContract(this.store.getMeta('goal:contract'), this.goalSource());
     const view = this.goalContext();
     const round = this.store.getMeta('goal:round', 0);
-    const reason = `provider 호출 누적 상한(${this.config.maxAttempts})에 도달하여 목표 달성을 입증하지 못했습니다.`;
+    const previous = this.store.getMeta('goal:assessment');
+    const expected = contract.requirements.map(requirement => requirement.id);
+    const evaluated = previous?.requirement_evaluations?.map(item => item.requirement_id) || [];
+    const assessedThisSegment = previous?.contract_revision === contract.revision
+      && previous.round > this.segmentStartGoalRound
+      && evaluated.length === expected.length && new Set(evaluated).size === evaluated.length
+      && evaluated.every(id => expected.includes(id));
+    const reason = `이번 실행 구간의 provider 호출 상한(${this.config.maxAttempts})에 도달했습니다. 목표는 완료되지 않았으며 resume하면 새 실행 구간에서 이어집니다.`;
     const assessment = {
-      decision: 'concluded', proposed_decision: 'continue', outcome: 'not_established', termination_reason: 'budget_exhausted',
+      decision: 'concluded', proposed_decision: assessedThisSegment ? previous.decision : 'continue', outcome: 'not_established',
+      termination_reason: 'segment_budget_exhausted', assessment_status: assessedThisSegment ? 'evaluated' : 'assessment_not_run',
       contract_revision: contract.revision,
-      requirement_evaluations: contract.requirements.map(requirement => ({ requirement_id: requirement.id,
-        verdict: 'unknown', fact_ids: [], reason: '호출 예산 안에서 이 조건의 충족을 현재 근거로 입증하지 못했습니다.' })),
-      reason, progress: '기록된 작업과 근거는 보존됐으며, 추가 실행에는 호출 예산을 늘려야 합니다.',
-      next_tasks: [], question: '', fact_ids: [], round, at: now(), concluded_at: now(),
+      requirement_evaluations: assessedThisSegment ? previous.requirement_evaluations
+        : contract.requirements.map(requirement => ({ requirement_id: requirement.id,
+          verdict: 'unknown', fact_ids: [], reason: '이번 실행 구간에서는 Goal 판정을 실행하지 못했습니다.' })),
+      reason, progress: assessedThisSegment ? previous.progress : '작업·사실·증거는 보존됐지만 이번 구간에서 목표 조건을 평가하지 못했습니다.',
+      next_tasks: [], question: '',
+      fact_ids: assessedThisSegment ? [...new Set(previous.requirement_evaluations.flatMap(item => item.fact_ids))].sort((a, b) => a - b) : [],
+      round, at: now(), concluded_at: now(),
     };
     const candidate = this.completionCandidate(view, contract);
     this.store.setMeta('goal:assessment', assessment);
-    this.store.event('goal.concluded', { round, reason: 'budget_exhausted', detail: reason,
-      attempts: this.store.attemptCount(), limit: this.config.maxAttempts });
-    return { kind: 'concluded', assessment, terminationReason: 'budget_exhausted', candidate };
+    this.store.event('goal.concluded', { round, reason: 'segment_budget_exhausted', detail: reason,
+      assessment_status: assessment.assessment_status, lifetime_attempts: this.store.attemptCount(),
+      segment_attempts: this.attemptBudgetUsed(), limit: this.config.maxAttempts });
+    return { kind: 'concluded', assessment, terminationReason: 'segment_budget_exhausted', candidate };
   }
   goalRoundBudgetConclusion() {
     const contract = this.validateStoredContract(this.store.getMeta('goal:contract'), this.goalSource());
     const view = this.goalContext();
     const round = this.store.getMeta('goal:round', 0);
-    const reason = `Goal 판정 누적 상한(${this.config.maxGoalRounds})에 도달하여 목표 달성을 추가로 판정하지 않았습니다.`;
+    const previous = this.store.getMeta('goal:assessment');
+    const expected = contract.requirements.map(requirement => requirement.id);
+    const evaluated = previous?.requirement_evaluations?.map(item => item.requirement_id) || [];
+    const validPrevious = previous?.contract_revision === contract.revision
+      && evaluated.length === expected.length && new Set(evaluated).size === evaluated.length
+      && evaluated.every(id => expected.includes(id));
+    const reason = `이번 실행 구간의 Goal 판정 상한(${this.config.maxGoalRounds})에 도달했습니다. 목표는 완료되지 않았으며 resume하면 새 실행 구간에서 이어집니다.`;
     const assessment = {
-      decision: 'concluded', proposed_decision: 'continue', outcome: 'not_established', termination_reason: 'budget_exhausted',
+      decision: 'concluded', proposed_decision: validPrevious ? previous.decision : 'continue', outcome: 'not_established',
+      termination_reason: 'goal_round_limit', assessment_status: validPrevious ? 'evaluated' : 'assessment_not_run',
       contract_revision: contract.revision,
-      requirement_evaluations: contract.requirements.map(requirement => ({ requirement_id: requirement.id,
-        verdict: 'unknown', fact_ids: [], reason: '판정 예산 안에서 이 조건의 충족을 현재 근거로 확정하지 못했습니다.' })),
-      reason, progress: '기록된 작업과 근거는 보존됐으며, 추가 판정에는 Goal 판정 한도를 늘려야 합니다.',
-      next_tasks: [], question: '', fact_ids: [], round, at: now(), concluded_at: now(),
+      requirement_evaluations: validPrevious ? previous.requirement_evaluations
+        : contract.requirements.map(requirement => ({ requirement_id: requirement.id,
+          verdict: 'unknown', fact_ids: [], reason: '이번 실행 구간에서는 이 조건을 평가하지 못했습니다.' })),
+      reason, progress: validPrevious ? previous.progress : '작업·사실·증거는 보존됐지만 이번 구간에서 목표 조건을 평가하지 못했습니다.',
+      next_tasks: [], question: '',
+      fact_ids: validPrevious ? [...new Set(previous.requirement_evaluations.flatMap(item => item.fact_ids))].sort((a, b) => a - b) : [],
+      round, at: now(), concluded_at: now(),
     };
     const candidate = this.completionCandidate(view, contract);
     this.store.setMeta('goal:assessment', assessment);
-    this.store.event('goal.concluded', { round, reason: 'budget_exhausted', detail: reason,
-      rounds: round, limit: this.config.maxGoalRounds });
-    return { kind: 'concluded', assessment, terminationReason: 'budget_exhausted', candidate };
+    this.store.event('goal.concluded', { round, reason: 'goal_round_limit', detail: reason,
+      segment_rounds: Math.max(0, round - this.segmentStartGoalRound), lifetime_rounds: round, limit: this.config.maxGoalRounds });
+    return { kind: 'concluded', assessment, terminationReason: 'goal_round_limit', candidate };
+  }
+  async segmentBudgetOutcome() {
+    if (this.store.getMeta('planned') && !this.goalRoundBudgetExhausted()) {
+      try {
+        this.assertControlBudget('goal');
+        await this.ensureGoalContract();
+        const checkpoint = await this.assessGoal();
+        this.resetControlFailures('goal');
+        if (checkpoint.kind === 'achieved' || checkpoint.kind === 'concluded') return checkpoint;
+        this.store.event('goal.segment_checkpoint', { kind: checkpoint.kind,
+          round: this.store.getMeta('goal:round', 0), segment_attempts: this.attemptBudgetUsed() });
+      } catch (error) {
+        if (this.abortController.signal.aborted) throw error;
+        const failures = error.code === 'ID2A_ATTEMPT_BUDGET' ? null : this.recordControlFailure('goal', error);
+        this.store.event('goal.segment_checkpoint_failed', { reason: error.message, ...(failures === null ? {} : { failures }) });
+      }
+    }
+    return this.attemptBudgetConclusion();
   }
   validateGoalAssessment(result, contract, view) {
     if (result.contract_revision !== contract.revision) throw new Error('목표 판정의 계약 revision이 현재 계약과 다릅니다.');
@@ -779,9 +826,16 @@ export class Engine {
     this.store.setMeta('goal:progress', state);
     return state;
   }
+  noProgressLimitReached(progress) {
+    if (progress.stagnant < this.config.maxNoProgress) return false;
+    if (!this.noProgressResumeGrace) return true;
+    this.noProgressResumeGrace = false;
+    this.store.event('goal.no_progress_resume_grace', { round: progress.round, stagnant: progress.stagnant });
+    return false;
+  }
   concludeAssessment(assessment, terminationReason, candidate) {
     const concluded = { ...assessment, proposed_decision: assessment.decision, decision: 'concluded',
-      outcome: 'not_established', termination_reason: terminationReason, concluded_at: now() };
+      outcome: 'not_established', termination_reason: terminationReason, assessment_status: 'evaluated', concluded_at: now() };
     this.store.setMeta('goal:assessment', concluded);
     this.store.event('goal.concluded', { round: assessment.round, reason: terminationReason, detail: assessment.reason });
     return { kind: 'concluded', assessment: concluded, terminationReason, candidate };
@@ -823,8 +877,8 @@ export class Engine {
       this.store.setMeta('state', 'running');
       this.store.event('goal.input_bypassed', { round, question: result.question, reason: result.reason });
       const progress = this.progressState(assessment);
-      if (round >= this.config.maxGoalRounds) return this.concludeAssessment(assessment, 'budget_exhausted', candidate);
-      if (progress.stagnant >= this.config.maxNoProgress) return this.concludeAssessment(assessment, 'no_progress', candidate);
+      if (this.goalRoundBudgetExhausted(round)) return this.concludeAssessment(assessment, 'goal_round_limit', candidate);
+      if (this.noProgressLimitReached(progress)) return this.concludeAssessment(assessment, 'no_progress', candidate);
       return { kind: 'retry' };
     }
     this.store.setMeta('goal:round', round);
@@ -848,7 +902,7 @@ export class Engine {
       if (review.decision === 'reject') {
         this.store.setMeta('goal:feedback', `독립 완료 검토가 달성 후보를 거절했습니다: ${review.reason}`);
         this.store.event('goal.achievement_rejected', { round, reason: review.reason });
-        if (round >= this.config.maxGoalRounds) return this.concludeAssessment(assessment, 'budget_exhausted', candidate);
+        if (this.goalRoundBudgetExhausted(round)) return this.concludeAssessment(assessment, 'goal_round_limit', candidate);
         return { kind: 'retry' };
       }
       return { kind: 'achieved', assessment, candidate };
@@ -859,8 +913,7 @@ export class Engine {
       return { kind: 'waiting', marker: beforeMessage };
     }
     const progress = this.progressState(assessment);
-    if (round >= this.config.maxGoalRounds) return this.concludeAssessment(assessment, 'budget_exhausted', candidate);
-    if (progress.stagnant >= this.config.maxNoProgress) return this.concludeAssessment(assessment, 'no_progress', candidate);
+    if (this.noProgressLimitReached(progress)) return this.concludeAssessment(assessment, 'no_progress', candidate);
     const scheduled = this.queueGoalTasks(result.next_tasks, round, result.reason);
     if (!scheduled.length) {
       const feedback = '계속 판정이 실행 가능한 새 작업을 만들지 못했습니다. 완료된 작업을 반복하지 말고 다른 구체적 접근을 제안하세요.';
@@ -870,6 +923,10 @@ export class Engine {
     }
     this.store.setMeta('state', 'running');
     this.store.event('goal.continued', { round, tasks: scheduled });
+    if (this.goalRoundBudgetExhausted(round)) {
+      const queuedCandidate = this.completionCandidate(this.goalContext(), contract);
+      return this.concludeAssessment(assessment, 'goal_round_limit', queuedCandidate);
+    }
     return { kind: 'continue', tasks: scheduled };
   }
   async waitForInstruction(marker) {
@@ -923,6 +980,7 @@ export class Engine {
     };
     let editor = null;
     let editorError = null;
+    let controllerCheckpoint = false;
     const draft = this.store.getMeta('report:draft');
     if (draft?.id === reportID && draft.editor) {
       try {
@@ -931,6 +989,12 @@ export class Engine {
         editorError = draft.editor_error || null;
         this.store.event('report.draft_reused', { id: reportID });
       } catch (error) { this.store.event('report.draft_invalid', { id: reportID, reason: error.message }); }
+    }
+    if (!editor && terminationReason === 'segment_budget_exhausted') {
+      controllerCheckpoint = true;
+      editor = { title: 'ID2A 진행 체크포인트',
+        body: '목표는 아직 달성되지 않았습니다. 저장된 작업·사실·증거에서 다음 실행 구간을 이어가세요.', fact_ids: [] };
+      this.store.event('report.controller_checkpoint', { reason: terminationReason });
     }
     if (!editor) {
       try {
@@ -955,15 +1019,17 @@ export class Engine {
       this.store.setMeta('goal:pending_terminal', null);
       return 'changed';
     }
-    const state = 'completed';
+    const state = goalOutcome === 'achieved' ? 'completed' : 'suspended';
     const termination = { reason: terminationReason, at: now(), assessment_round: assessment.round, contract_revision: contract.revision };
     const generating = { state: 'generating', id: reportID, contract_revision: contract.revision,
-      assessment_round: assessment.round, generation: editorError ? 'controller_fallback' : 'editor', ...(editorError ? { editor_error: editorError } : {}) };
+      assessment_round: assessment.round,
+      generation: controllerCheckpoint ? 'controller_checkpoint' : editorError ? 'controller_fallback' : 'editor',
+      ...(editorError ? { editor_error: editorError } : {}) };
     if (!this.store.commitGoalOutcome(candidate, { outcome: goalOutcome, termination, assessment, report: generating })) {
       this.store.setMeta('goal:pending_terminal', null);
       return 'changed';
     }
-    const manifest = { format_version: 3, goal_format_version: this.store.getMeta('goal:format_version', 0),
+    const manifest = { format_version: 4, goal_format_version: this.store.getMeta('goal:format_version', 0),
       run: this.manifest.id, state, execution: { state }, goal_outcome: goalOutcome,
       termination, report: generating, contract, source: this.manifest.source, current_source: sourceIdentity(this.config.workspace),
       goal: assessment, tasks, facts, conflicts: conflicted, editor, ended: now() };
@@ -985,8 +1051,10 @@ export class Engine {
       const complete = { ...generating, state: 'complete', path: reportPath, completed_at: now() };
       this.writeResult({ ...manifest, report: complete });
       this.store.setMeta('report:status', complete);
-      this.store.event('run.finished', { state, goal_outcome: goalOutcome, termination_reason: terminationReason,
-        tasks: tasks.length, verified: facts.length, report: reportPath });
+      this.store.event(state === 'completed' ? 'run.finished' : 'run.suspended', {
+        state, goal_outcome: goalOutcome, termination_reason: terminationReason,
+        tasks: tasks.length, verified: facts.length, report: reportPath,
+      });
     } catch (error) {
       const failed = { ...generating, state: 'failed', reason: error.message, failed_at: now() };
       this.store.setMeta('report:status', failed);
@@ -1034,8 +1102,9 @@ export class Engine {
       const resumed = await this.resumeTerminalReport(pendingTerminal, 'report.resume_pending');
       if (resumed !== 'changed') return resumed;
     } else if (pendingTerminal) {
+      if (pendingTerminal.terminationReason === 'no_progress') this.noProgressResumeGrace = true;
       this.store.setMeta('goal:pending_terminal', null);
-      this.store.event('goal.pending_terminal_discarded', { reason: 'budget_increased', round: pendingTerminal.assessment.round });
+      this.store.event('goal.pending_terminal_discarded', { reason: 'explicit_resume', round: pendingTerminal.assessment.round });
     }
     const reusableTerminal = this.reusableTerminalOutcome(previousStatus);
     if (reusableTerminal && this.terminalLimitStillApplies(reusableTerminal)) {
@@ -1047,8 +1116,11 @@ export class Engine {
       }
       const repaired = await this.resumeTerminalReport(reusableTerminal, 'report.retry');
       if (repaired !== 'changed') return repaired;
+    } else if (reusableTerminal) {
+      this.store.event('run.resume_suspended', { termination_reason: reusableTerminal.terminationReason,
+        previous_round: reusableTerminal.assessment.round });
     }
-    if (['completed', 'stopped', 'failed'].includes(previousStatus.execution_state)) {
+    if (['completed', 'suspended', 'stopped', 'failed'].includes(previousStatus.execution_state)) {
       const history = this.store.getMeta('run:history', []);
       history.push({ ...previousStatus, recorded_at: now(), assessment: this.store.getMeta('goal:assessment') });
       this.store.setMeta('run:history', history.slice(-100));
@@ -1060,7 +1132,11 @@ export class Engine {
     this.store.setMeta('run:termination', null);
     const previousReport = this.store.getMeta('report:status', { state: 'not_started' });
     if (['complete', 'failed', 'generating'].includes(previousReport.state)) this.store.setMeta('report:status', { ...previousReport, state: 'stale' });
-    this.store.event('run.started', { run: this.manifest.id });
+    const segment = (this.store.getMeta('run:segment', 0) || 0) + 1;
+    this.store.setMeta('run:segment', segment);
+    this.store.event('run.started', { run: this.manifest.id, segment,
+      segment_start_attempt: this.segmentStartAttempt, max_attempts: this.config.maxAttempts,
+      segment_start_goal_round: this.segmentStartGoalRound, max_goal_rounds: this.config.maxGoalRounds });
     const ticker = setInterval(() => this.poll().catch(error => this.store.event('controller.warning', { reason: error.message })), 300);
     try {
       while (!this.abortController.signal.aborted) {
@@ -1082,7 +1158,7 @@ export class Engine {
       this.store.setMeta('state', 'running');
       while (!this.store.getMeta('planned') && !this.abortController.signal.aborted) {
         if (this.attemptBudgetExhausted()) {
-          const reported = await this.report(this.attemptBudgetConclusion());
+          const reported = await this.report(await this.segmentBudgetOutcome());
           if (reported === 'changed') throw new AttemptBudgetError(this.config.maxAttempts);
           return reported;
         }
@@ -1093,7 +1169,7 @@ export class Engine {
         }
         catch (error) {
           if (error.code === 'ID2A_ATTEMPT_BUDGET') {
-            const reported = await this.report(this.attemptBudgetConclusion());
+            const reported = await this.report(await this.segmentBudgetOutcome());
             if (reported === 'changed') throw error;
             return reported;
           }
@@ -1114,7 +1190,7 @@ export class Engine {
         await this.poll();
         if (this.store.getMeta('control') === 'paused') { await sleep(200); continue; }
         if (!this.activeTasks.size && this.attemptBudgetExhausted()) {
-          const reported = await this.report(this.attemptBudgetConclusion());
+          const reported = await this.report(await this.segmentBudgetOutcome());
           if (reported === 'changed') throw new AttemptBudgetError(this.config.maxAttempts);
           return reported;
         }
@@ -1136,13 +1212,13 @@ export class Engine {
           try {
             this.assertControlBudget('goal');
             await this.ensureGoalContract();
-            outcome = this.store.getMeta('goal:round', 0) >= this.config.maxGoalRounds
+            outcome = this.goalRoundBudgetExhausted()
               ? this.goalRoundBudgetConclusion()
               : await this.assessGoal();
             this.resetControlFailures('goal');
           } catch (error) {
             if (error.code === 'ID2A_ATTEMPT_BUDGET') {
-              const reported = await this.report(this.attemptBudgetConclusion());
+              const reported = await this.report(await this.segmentBudgetOutcome());
               if (reported === 'changed') throw error;
               return reported;
             }
@@ -1154,7 +1230,13 @@ export class Engine {
             await sleep(Math.min(30000, 1000 * (2 ** Math.min(goalFailures - 1, 5))));
             continue;
           }
-          if (outcome.kind === 'changed' || outcome.kind === 'continue') continue;
+          if (outcome.kind === 'changed') continue;
+          if ((outcome.kind === 'continue' || outcome.kind === 'retry') && this.attemptBudgetExhausted()) {
+            const reported = await this.report(this.attemptBudgetConclusion());
+            if (reported === 'changed') continue;
+            return reported;
+          }
+          if (outcome.kind === 'continue') continue;
           if (outcome.kind === 'retry') { await sleep(1000); continue; }
           if (outcome.kind === 'waiting') { await this.waitForInstruction(outcome.marker); continue; }
           const reported = await this.report(outcome);

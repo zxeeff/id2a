@@ -191,7 +191,7 @@ test('report write failure preserves the committed goal outcome and replaces sta
     assert.equal(completion.termination.reason, 'goal_achieved');
     assert.equal(completion.report.state, 'failed');
     const result = readJSON(path.join(env.run, 'result.json'));
-    assert.equal(result.format_version, 3);
+    assert.equal(result.format_version, 4);
     assert.equal(result.goal_format_version, 1);
     assert.equal(result.goal_outcome, 'achieved');
     assert.equal(result.report.state, 'failed');
@@ -229,7 +229,7 @@ test('a read-only stale result file is repaired before publishing the current ou
     const result = readJSON(resultPath);
     assert.equal(completion.goal_outcome, 'achieved');
     assert.equal(completion.report.state, 'complete');
-    assert.equal(result.format_version, 3);
+    assert.equal(result.format_version, 4);
     assert.equal(result.goal_outcome, 'achieved');
     assert.equal(result.report.state, 'complete');
     assert.notEqual(result.report.id, 'stale');
@@ -383,10 +383,11 @@ test('an accepted report and verified activity cannot become achievement after i
     };
     return defaultResult(message);
   }) }); env.dispose(() => engine.close());
-  assert.equal(await engine.run(), 'completed');
+  assert.equal(await engine.run(), 'suspended');
   const completion = engine.store.completionStatus();
+  assert.equal(completion.execution_state, 'suspended');
   assert.equal(completion.goal_outcome, 'not_established');
-  assert.equal(completion.termination.reason, 'budget_exhausted');
+  assert.equal(completion.termination.reason, 'goal_round_limit');
   assert.equal(completion.report.state, 'complete');
   assert(engine.store.tasks().every(item => item.state === 'accepted'));
   assert.match(readText(path.join(env.run, 'report.md')), /목표 결과: 미입증/u);
@@ -407,7 +408,7 @@ test('repeated work without requirement progress ends finitely without claiming 
     };
     return defaultResult(message);
   }) }); env.dispose(() => engine.close());
-  assert.equal(await engine.run(), 'completed');
+  assert.equal(await engine.run(), 'suspended');
   const completion = engine.store.completionStatus();
   assert.equal(workers, 2);
   assert.equal(completion.goal_outcome, 'not_established');
@@ -432,26 +433,56 @@ test('repeated needs_input in autonomous mode is bounded by the same no-progress
     }
     return defaultResult(message);
   }) }); env.dispose(() => engine.close());
-  assert.equal(await engine.run(), 'completed');
+  assert.equal(await engine.run(), 'suspended');
   assert.equal(reviews, 2);
   assert.equal(engine.store.completionStatus().goal_outcome, 'not_established');
   assert.equal(engine.store.completionStatus().termination.reason, 'no_progress');
 });
 
-test('the persistent provider-attempt budget concludes without starting another task', async t => {
+test('a segment attempt limit suspends without publishing a completed outcome', async t => {
   const env = fixture(t, { maxAttempts: 3 });
   const roles = [];
   const engine = new Engine(env.run, { providerFactory: scriptedFactory(message => {
     roles.push(message.role);
     return defaultResult(message);
   }) }); env.dispose(() => engine.close());
-  assert.equal(await engine.run(), 'completed');
+  assert.equal(await engine.run(), 'suspended');
   const completion = engine.store.completionStatus();
+  assert.equal(completion.execution_state, 'suspended');
   assert.equal(completion.goal_outcome, 'not_established');
-  assert.equal(completion.termination.reason, 'budget_exhausted');
-  assert.equal(engine.store.attemptCount(), 3);
-  assert.deepEqual(roles, ['contract', 'contract_review', 'editor']);
-  assert.equal(engine.store.tasks().length, 0);
+  assert.equal(completion.termination.reason, 'segment_budget_exhausted');
+  assert.equal(engine.store.attemptCount(), 4);
+  assert.deepEqual(roles, ['contract', 'contract_review', 'planner', 'goal']);
+  assert.equal(engine.store.tasks().length, 1);
+  assert.equal(engine.store.events(0, 1000).some(event => event.type === 'run.finished'), false);
+});
+
+test('an explicit resume receives a fresh attempt segment without changing configuration', async t => {
+  const env = fixture(t, { maxAttempts: 3 });
+  const roles = [];
+  const factory = scriptedFactory(message => {
+    roles.push(message.role);
+    if (message.role === 'worker') return workerResult(env.workspace);
+    return defaultResult(message);
+  });
+  const first = new Engine(env.run, { providerFactory: factory });
+  let firstAttempts, firstCalls;
+  try {
+    assert.equal(await first.run(), 'suspended');
+    firstAttempts = first.store.attemptCount();
+    firstCalls = roles.length;
+    assert.equal(firstAttempts, 4);
+  } finally { first.close(); }
+
+  const resumed = new Engine(env.run, { providerFactory: factory });
+  try {
+    assert.equal(await resumed.run(), 'completed');
+    assert(resumed.store.attemptCount() > firstAttempts);
+    assert(roles.length > firstCalls);
+    assert(roles.slice(firstCalls).includes('worker'));
+    assert.equal(resumed.store.completionStatus().execution_state, 'completed');
+    assert.equal(resumed.store.completionStatus().goal_outcome, 'achieved');
+  } finally { resumed.close(); }
 });
 
 test('controller failure budgets survive resume until configuration or input changes', async t => {
@@ -495,7 +526,7 @@ test('a control failure after an in-flight instruction change starts a fresh con
   assert.equal(engine.store.getMeta('control:failures:contract').count, 1);
 });
 
-test('an unchanged achieved run is idempotent even when its attempt budget is exactly spent', async t => {
+test('a completed achieved run remains idempotent across a new attempt segment', async t => {
   const env = fixture(t, { maxAttempts: 9 });
   const roles = [];
   const factory = scriptedFactory(message => {
@@ -535,8 +566,8 @@ test('an unchanged achieved run is idempotent even when its attempt budget is ex
   } finally { resumed.close(); }
 });
 
-test('attempt exhaustion defers review without consuming task failures and resumes after a budget increase', async t => {
-  const env = fixture(t, { maxAttempts: 5, maxFailures: 1 });
+test('segment exhaustion defers review without consuming task failures and resumes without a budget increase', async t => {
+  const env = fixture(t, { maxAttempts: 4, maxFailures: 1 });
   let workers = 0, reviews = 0;
   const factory = scriptedFactory(message => {
     if (message.role === 'worker') { workers++; return workerResult(env.workspace); }
@@ -545,14 +576,14 @@ test('attempt exhaustion defers review without consuming task failures and resum
   });
   const first = new Engine(env.run, { providerFactory: factory });
   try {
-    assert.equal(await first.run(), 'completed');
+    assert.equal(await first.run(), 'suspended');
     const pending = first.store.task(1);
     assert.equal(first.store.completionStatus().goal_outcome, 'not_established');
+    assert.equal(first.store.completionStatus().termination.reason, 'segment_budget_exhausted');
+    assert.equal(first.store.completionStatus().execution_state, 'suspended');
     assert.equal(pending.state, 'reviewing');
     assert.equal(pending.failures, 0);
     assert(pending.result);
-    const config = first.store.getMeta('config');
-    first.store.setMeta('config', { ...config, maxAttempts: 12 });
   } finally { first.close(); }
 
   const resumed = new Engine(env.run, { providerFactory: factory });
@@ -566,11 +597,12 @@ test('attempt exhaustion defers review without consuming task failures and resum
   } finally { resumed.close(); }
 });
 
-test('an exhausted goal-round budget is not spent again by unchanged resumes', async t => {
+test('a goal-round segment suspends and an explicit resume receives a fresh Goal round', async t => {
   const env = fixture(t, { maxGoalRounds: 1 });
   let goalCalls = 0;
+  let workers = 0;
   const factory = scriptedFactory(message => {
-    if (message.role === 'worker') return workerResult(env.workspace);
+    if (message.role === 'worker') { workers++; return workerResult(env.workspace); }
     if (message.role === 'goal') {
       goalCalls++;
       return {
@@ -578,24 +610,30 @@ test('an exhausted goal-round budget is not spent again by unchanged resumes', a
         requirement_evaluations: message.data.contract.requirements.map(requirement => ({ requirement_id: requirement.id,
           verdict: 'unknown', fact_ids: [], reason: 'The requested outcome is not yet established.' })),
         reason: 'More work would be required.', progress: 'The first bounded attempt is complete.',
-        next_tasks: [{ title: 'Another approach', brief: 'Try a distinct implementation approach.', scope: 'docs.runtime.alternative', depends_on: [] }], question: '',
+        next_tasks: [{ title: `Another approach ${goalCalls}`, brief: `Try distinct implementation approach ${goalCalls}.`, scope: `docs.runtime.alternative.${goalCalls}`, depends_on: [] }], question: '',
       };
     }
     return defaultResult(message);
   });
   const first = new Engine(env.run, { providerFactory: factory });
   try {
-    assert.equal(await first.run(), 'completed');
+    assert.equal(await first.run(), 'suspended');
     assert.equal(first.store.completionStatus().goal_outcome, 'not_established');
+    assert.equal(first.store.completionStatus().termination.reason, 'goal_round_limit');
     assert.equal(first.store.getMeta('goal:round'), 1);
+    assert.equal(workers, 1);
+    assert.equal(first.store.tasks().filter(task => task.state === 'queued').length, 1);
   } finally { first.close(); }
 
   const resumed = new Engine(env.run, { providerFactory: factory });
   try {
-    assert.equal(await resumed.run(), 'completed');
+    assert.equal(await resumed.run(), 'suspended');
     assert.equal(resumed.store.completionStatus().goal_outcome, 'not_established');
-    assert.equal(resumed.store.getMeta('goal:round'), 1);
-    assert.equal(goalCalls, 1);
+    assert.equal(resumed.store.completionStatus().termination.reason, 'goal_round_limit');
+    assert.equal(resumed.store.getMeta('goal:round'), 2);
+    assert.equal(goalCalls, 2);
+    assert.equal(workers, 2);
+    assert.equal(resumed.store.tasks().filter(task => task.state === 'queued').length, 1);
   } finally { resumed.close(); }
 
   const store = new Store(env.run);
@@ -603,15 +641,18 @@ test('an exhausted goal-round budget is not spent again by unchanged resumes', a
   finally { store.close(); }
   const revised = new Engine(env.run, { providerFactory: factory });
   try {
-    assert.equal(await revised.run(), 'completed');
+    assert.equal(await revised.run(), 'suspended');
     assert.equal(revised.store.completionStatus().goal_outcome, 'not_established');
-    assert.equal(revised.store.getMeta('goal:round'), 1);
+    assert.equal(revised.store.completionStatus().termination.reason, 'goal_round_limit');
+    assert.equal(revised.store.getMeta('goal:round'), 3);
     assert.equal(revised.store.getMeta('goal:contract').revision, 2);
-    assert.equal(goalCalls, 1);
+    assert.equal(goalCalls, 3);
+    assert.equal(workers, 3);
+    assert.equal(revised.store.tasks().filter(task => task.state === 'queued').length, 1);
   } finally { revised.close(); }
 });
 
-test('a terminal candidate interrupted during editing resumes without another Goal round', async t => {
+test('a non-achievement candidate interrupted during editing gets a fresh Goal round on explicit resume', async t => {
   const env = fixture(t, { maxGoalRounds: 1 });
   let engine, stopEditor = true, goalCalls = 0;
   const firstFactory = scriptedFactory(message => {
@@ -641,15 +682,16 @@ test('a terminal candidate interrupted during editing resumes without another Go
   } finally { engine.close(); }
 
   const resumed = new Engine(env.run, { providerFactory: scriptedFactory(message => {
-    if (message.role === 'goal') throw new Error('Goal must not run again');
+    if (message.role === 'goal') goalCalls++;
     return defaultResult(message);
   }) });
   try {
     assert.equal(await resumed.run(), 'completed');
-    assert.equal(resumed.store.completionStatus().goal_outcome, 'not_established');
-    assert.equal(resumed.store.getMeta('goal:round'), 1);
+    assert.equal(resumed.store.completionStatus().goal_outcome, 'achieved');
+    assert.equal(resumed.store.getMeta('goal:round'), 2);
     assert.equal(resumed.store.getMeta('goal:pending_terminal'), null);
-    assert.equal(goalCalls, 1);
+    assert.equal(goalCalls, 2);
+    assert(resumed.store.events(0, 1000).some(event => event.type === 'goal.pending_terminal_discarded'));
   } finally { resumed.close(); }
 });
 

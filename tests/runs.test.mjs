@@ -45,11 +45,17 @@ function invoke(args, cwd) {
 
 test('latest and list are scoped to the selected workspace unless global is requested', t => {
   const env = runFixture(t);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(env.latestA, 'run.json'), 'utf8')).version, 4);
   assert.deepEqual(listRuns(env.runs, { workspace: env.workspaceA }).map(run => run.directory), [env.latestA, env.oldA]);
   assert.equal(resolveRun('latest', env.runs, { workspace: env.workspaceA }), env.latestA);
   assert.equal(resolveRun('latest', env.runs, { workspace: env.workspaceA, global: true }), env.latestGlobal);
   assert.equal(resolveRun(path.basename(env.latestGlobal), env.runs, { workspace: env.workspaceA }), env.latestGlobal);
   assert.throws(() => resolveRun('latest', env.runs, { workspace: env.workspaceEmpty }), /--global/u);
+});
+
+test('the package version matches the v4 run and completion format', () => {
+  const packageJSON = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(packageJSON.version, '0.4.0');
 });
 
 test('CLI scopes list and latest commands to cwd while --global and explicit IDs bypass the scope', t => {
@@ -67,7 +73,7 @@ test('CLI scopes list and latest commands to cwd while --global and explicit IDs
   assert.equal(localStatus.status, 0, localStatus.stderr);
   const localStatusJSON = JSON.parse(localStatus.stdout);
   assert.equal(localStatusJSON.state, 'latest-a');
-  assert.equal(localStatusJSON.format_version, 3);
+  assert.equal(localStatusJSON.format_version, 4);
   assert.equal(localStatusJSON.goal_format_version, 1);
 
   const globalStatus = invoke(['status', 'latest', '--runs-root', env.runs, '--global', '--json'], env.workspaceA);
@@ -90,11 +96,30 @@ test('legacy completed runs are not inferred to have achieved their goal', t => 
     store.setMeta('state', 'completed');
     store.db.prepare("DELETE FROM meta WHERE key IN ('goal:format_version','goal:outcome','run:termination','report:status')").run();
     const completion = store.completionStatus();
-    assert.equal(completion.format_version, 3);
+    assert.equal(completion.format_version, 4);
     assert.equal(completion.goal_format_version, 0);
     assert.equal(completion.execution_state, 'completed');
     assert.equal(completion.goal_outcome, 'legacy_unknown');
     assert.equal(completion.termination.reason, 'legacy_unknown');
+  } finally { store.close(); }
+});
+
+test('a legacy v3 completed budget exhaustion is projected as resumable suspension', t => {
+  const env = runFixture(t);
+  const manifestPath = path.join(env.latestA, 'run.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  fs.writeFileSync(manifestPath, JSON.stringify({ ...manifest, version: 3 }, null, 2) + '\n', 'utf8');
+  const store = new Store(env.latestA);
+  try {
+    store.setMeta('state', 'completed');
+    store.setMeta('goal:outcome', 'not_established');
+    store.setMeta('run:termination', { reason: 'budget_exhausted', at: '2026-01-02T00:00:00.000Z' });
+    store.setMeta('report:status', { state: 'complete', id: 'legacy-budget-report' });
+    const completion = store.completionStatus();
+    assert.equal(store.getMeta('state'), 'completed');
+    assert.equal(completion.format_version, 4);
+    assert.equal(completion.execution_state, 'suspended');
+    assert.equal(completion.goal_outcome, 'not_established');
   } finally { store.close(); }
 });
 
