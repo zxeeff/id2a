@@ -16,7 +16,7 @@ try {
   for (const [provider, Constructor] of [['codex', CodexSession], ['claude', ClaudeSession]]) {
     let session, steering, submitted = false;
     session = new Constructor({
-      cwd: directory, timeout: 120,
+      cwd: directory,
       onSession: (_sessionID, turnID) => {
         if (submitted || (provider === 'codex' && !turnID)) return;
         submitted = true;

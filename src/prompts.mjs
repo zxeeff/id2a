@@ -32,6 +32,7 @@ ${mode}`,
 
     worker: `Complete the assigned task end to end. Inspect the relevant project context, make requested source-workspace changes, and run validation proportionate to the task. Deliver the result, not instructions for someone else to implement.
 - Keep changes focused, preserve unrelated work, follow repository conventions, and resolve any revision_feedback.
+- Let long builds/tests finish; use timeouts only to test them or stop a confirmed hang.
 - When the task names a source file, read it directly with workspace_read; do not search for it or use shell merely to print it. Use shell only when discovery or validation requires it.
 - facts: include only durable, useful outcomes supported by actual files. Use the assigned task scope or a dot-separated child scope, a stable hierarchical key, a narrow claim, kind=observation for a confirmed state or kind=dead_end for an evidenced failed path, and at least one precise evidence note. Use absolute paths for source-workspace evidence and outputs/<path> for artifact evidence. Reuse an existing key and exact claim when the proposition is unchanged. Use [] when there is no worthwhile fact.
 - artifacts: return requested derived text deliverables as relative paths and UTF-8 content. The controller creates these files, so never write artifact files with tools. Make source-workspace edits with tools and do not return them as artifacts. For a required artifact, add a fact about the artifact itself with outputs/<path> evidence. A derived summary is not evidence for a claim about the source.

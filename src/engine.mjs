@@ -54,9 +54,12 @@ export function configuration(input = {}) {
     permissions: 'yolo', inputPolicy: 'continue', effort: provider === 'codex' ? 'xhigh' : 'auto',
     model: provider === 'codex' ? 'gpt-5.6-sol' : null, maxTasks: 8, maxRevisions: 2,
     maxFailures: 2, maxControlFailures: 5, maxGoalRounds: 12, maxNoProgress: 3, maxAttempts: 100,
-    contextCharacters: 12000, curatorBatch: 4, timeout: 1200,
+    contextCharacters: 12000, curatorBatch: 4,
     roleSettings: {}, ...input,
   };
+  // Older run manifests may contain the former per-agent wall-clock timeout.
+  // Agent turns now run until completion, an explicit stop, or provider failure.
+  delete config.timeout;
   config.workspace = fs.realpathSync(config.workspace);
   if (!fs.statSync(config.workspace).isDirectory()) throw new Error('workspace는 폴더여야 합니다.');
   if (!['codex', 'claude'].includes(config.provider)) throw new Error('provider는 codex 또는 claude입니다.');
@@ -64,7 +67,7 @@ export function configuration(input = {}) {
   if (!['continue', 'wait'].includes(config.inputPolicy)) throw new Error('inputPolicy는 continue 또는 wait입니다.');
   const levels = ['auto', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
   if (!levels.includes(config.effort)) throw new Error('잘못된 effort');
-  for (const [label, min, max] of [['workers', 1, 32], ['maxTasks', 1, 32], ['maxRevisions', 0, 20], ['maxFailures', 1, 10], ['maxControlFailures', 1, 20], ['maxGoalRounds', 1, 1000], ['maxNoProgress', 1, 100], ['maxAttempts', 3, 100000], ['contextCharacters', 2000, 100000], ['curatorBatch', 1, 100], ['timeout', 5, 86400]]) {
+  for (const [label, min, max] of [['workers', 1, 32], ['maxTasks', 1, 32], ['maxRevisions', 0, 20], ['maxFailures', 1, 10], ['maxControlFailures', 1, 20], ['maxGoalRounds', 1, 1000], ['maxNoProgress', 1, 100], ['maxAttempts', 3, 100000], ['contextCharacters', 2000, 100000], ['curatorBatch', 1, 100]]) {
     config[label] = integer(config[label], label, min, max);
   }
   for (const [role, settings] of Object.entries(config.roleSettings)) {
@@ -237,7 +240,7 @@ export class Engine {
     const workingDirectory = role === 'worker' ? this.config.workspace : taskDirectory;
     const session = this.providerFactory(settings.provider, {
       cwd: workingDirectory, taskDirectory, workspace: this.config.workspace, runDirectory: this.directory,
-      timeout: this.config.timeout, bin: this.config[settings.provider + 'Bin'],
+      bin: this.config[settings.provider + 'Bin'],
       onEvent, onRaw: event => fs.appendFileSync(path.join(attemptDirectory, 'raw.jsonl'), JSON.stringify(event) + '\n'),
       onSession: (sessionID, turnID) => this.store.session(attempt, sessionID, turnID),
     });
@@ -795,7 +798,6 @@ export class Engine {
     return hash(JSON.stringify({
       source: this.goalSource().fingerprint,
       roles: (roleMap[stage] || []).map(role => [role, this.settings(role)]),
-      timeout: this.config.timeout,
       permissions: this.config.permissions,
       inputPolicy: this.config.inputPolicy,
       codexBin: this.config.codexBin || null,
@@ -1298,7 +1300,7 @@ export class Engine {
       this.validateGoalAssessment(assessment, contract, view);
       this.validateGoalReview(assessment.independent_review, contract);
     }
-    const editorConfiguration = { ...this.settings('editor'), timeout: this.config.timeout, permissions: this.config.permissions,
+    const editorConfiguration = { ...this.settings('editor'), permissions: this.config.permissions,
       codexBin: this.config.codexBin || null, claudeBin: this.config.claudeBin || null };
     const { control_epoch: _leaseEpoch, ...reportCandidate } = candidate;
     const reportID = hash(JSON.stringify({ candidate: reportCandidate, goalOutcome, terminationReason, assessment, editorConfiguration }));

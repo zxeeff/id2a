@@ -11,7 +11,7 @@ import { VERSION, integer, readJSON, readText, resolveCLI, sleep, writeJSON } fr
 
 const options = Object.fromEntries([
   'workspace', 'provider', 'review-provider', 'model', 'review-model', 'effort', 'review-effort',
-  'workers', 'permissions', 'max-tasks', 'max-revisions', 'timeout', 'context-chars', 'curator-batch',
+  'workers', 'permissions', 'max-tasks', 'max-revisions', 'context-chars', 'curator-batch',
   'max-goal-rounds', 'max-no-progress', 'max-control-failures', 'max-attempts',
   'input-policy',
   'prompt', 'prompt-file', 'file', 'config', 'runs-root', 'codex-bin', 'claude-bin', 'target', 'query',
@@ -55,7 +55,8 @@ start: 초기 프롬프트를 여러 줄로 붙여 넣고 마지막에 /end를 �
        Claude 기본: CLI 모델 설정, effort auto
        --model MODEL  --review-model MODEL  --review-effort LEVEL
        --max-tasks 8  --max-revisions 2  --max-goal-rounds 12  --max-no-progress 3
-       --max-control-failures 5  --max-attempts 100  --timeout 1200  --no-interactive  --json
+       --max-control-failures 5  --max-attempts 100  --no-interactive  --json
+       Agent turns have no wall-clock timeout; they run until completion, explicit stop, or provider failure.
        --max-tasks는 전체 종료 한도가 아니라 한 목표 사이클이 제안할 수 있는 작업 상한입니다.
        호출·Goal·무진전 한도는 종료 조건이 아니라 체크포인트 주기입니다. 목표 달성 또는 명시적 stop까지 새 구간을 자동으로 이어갑니다.
        --config config.json으로 역할별 provider/model/effort도 지정할 수 있습니다.
@@ -76,7 +77,7 @@ latest와 list는 기본적으로 현재 폴더를 workspace로 사용하는 run
 function configPatch(base = {}) {
   const patch = { ...base, roleSettings: structuredClone(base.roleSettings || {}) };
   const map = { workspace: 'workspace', provider: 'provider', model: 'model', effort: 'effort', workers: 'workers',
-    permissions: 'permissions', 'max-tasks': 'maxTasks', 'max-revisions': 'maxRevisions', timeout: 'timeout',
+    permissions: 'permissions', 'max-tasks': 'maxTasks', 'max-revisions': 'maxRevisions',
     'max-goal-rounds': 'maxGoalRounds', 'max-no-progress': 'maxNoProgress', 'max-control-failures': 'maxControlFailures',
     'max-attempts': 'maxAttempts',
     'input-policy': 'inputPolicy',

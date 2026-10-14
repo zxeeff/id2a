@@ -12,8 +12,8 @@ const schema = {
 const prompt = 'Run the read-only command `git --version`, then return only the required JSON object with the exact command output in value.';
 
 const runs = [
-  ['codex', new CodexSession({ cwd: workspace, timeout: 180 }), { model: 'gpt-5.6-sol', effort: 'low' }],
-  ['claude', new ClaudeSession({ cwd: workspace, timeout: 180 }), { effort: 'auto' }],
+  ['codex', new CodexSession({ cwd: workspace }), { model: 'gpt-5.6-sol', effort: 'low' }],
+  ['claude', new ClaudeSession({ cwd: workspace }), { effort: 'auto' }],
 ];
 const results = [];
 for (const [provider, session, settings] of runs) {

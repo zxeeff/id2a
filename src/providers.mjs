@@ -120,7 +120,6 @@ export class CodexSession {
     finished.catch(() => {});
     const abort = () => this.fail(new Error('작업 중단 요청'));
     signal?.addEventListener('abort', abort, { once: true });
-    const timer = setTimeout(() => this.fail(new Error('에이전트 실행 시간 초과')), (this.options.timeout || 1200) * 1000);
     try {
       if (signal?.aborted) throw new Error('작업 중단 요청');
       await this.open();
@@ -155,7 +154,6 @@ export class CodexSession {
       return await finished;
     } finally {
       this.done = true;
-      clearTimeout(timer);
       signal?.removeEventListener('abort', abort);
       await this.protocol?.close();
     }
@@ -196,7 +194,6 @@ export class ClaudeSession {
     finished.catch(() => {});
     const abort = () => this.fail(new Error('작업 중단 요청'));
     signal?.addEventListener('abort', abort, { once: true });
-    const timer = setTimeout(() => this.fail(new Error('에이전트 실행 시간 초과')), (this.options.timeout || 1200) * 1000);
     try {
       if (signal?.aborted) throw new Error('작업 중단 요청');
       this.protocol = new JsonProcess('claude', args, this.options, message => this.receive(message), error => this.fail(error));
@@ -204,7 +201,6 @@ export class ClaudeSession {
       return await finished;
     } finally {
       this.done = true;
-      clearTimeout(timer);
       signal?.removeEventListener('abort', abort);
       await this.protocol?.close();
     }
