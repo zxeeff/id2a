@@ -94,7 +94,7 @@ export function createRun(input, goal, root = defaultRunsRoot) {
   const directory = path.resolve(root, id);
   fs.mkdirSync(directory, { recursive: true });
   fs.writeFileSync(path.join(directory, 'prompt.txt'), goal, 'utf8');
-  writeJSON(path.join(directory, 'run.json'), { id, version: 4, created: now(), source: sourceIdentity(config.workspace), config });
+  writeJSON(path.join(directory, 'run.json'), { id, version: 5, created: now(), source: sourceIdentity(config.workspace), config });
   const store = new Store(directory);
   try {
     store.setMeta('state', 'created');
@@ -139,6 +139,9 @@ export class Engine {
     this.activeTasks = new Map();
     this.abortController = new AbortController();
     this.polling = false;
+    this.controlEpoch = this.store.getMeta('control:epoch', 0) || 0;
+    this.initialControl = this.store.getMeta('control');
+    this.controlRevision = this.store.getMeta('control:revision', 0) || 0;
     this.segmentStartAttempt = this.store.attemptCount();
     this.segmentStartGoalRound = this.store.getMeta('goal:round', 0) || 0;
     const previous = this.store.completionStatus();
@@ -154,7 +157,7 @@ export class Engine {
       ...overrides };
   }
   stop() {
-    this.store.setMeta('control', 'stopped');
+    this.store.commitStopped('controller stop requested');
     this.abortController.abort();
   }
   async poll() {
@@ -162,7 +165,8 @@ export class Engine {
     this.polling = true;
     try {
       this.config = configuration(this.store.getMeta('config', this.config));
-      if (this.store.getMeta('control') === 'stopped') this.abortController.abort();
+      if (this.store.getMeta('control') === 'stopped'
+          || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch) this.abortController.abort();
       for (const [attempt, active] of this.sessions) {
         for (const message of this.store.pendingMessages(attempt, active.taskID)) {
           try {
@@ -179,6 +183,23 @@ export class Engine {
       }
     } finally { this.polling = false; }
   }
+  setControllerState(state) {
+    let updated = false;
+    this.store.transaction(() => {
+      if (this.abortController.signal.aborted || this.store.getMeta('control') !== 'running'
+          || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch) return;
+      this.store.setMeta('state', state);
+      updated = true;
+    });
+    if (!updated && (this.store.getMeta('control') === 'stopped'
+        || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch)) this.abortController.abort();
+    return updated;
+  }
+  controlLeaseLost() {
+    return this.abortController.signal.aborted || this.store.getMeta('control') === 'stopped'
+      || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch
+      || this.store.getMeta('control:lease') !== this.controlEpoch;
+  }
   async runAgent(role, task, data = {}) {
     const settings = this.settings(role);
     const taskID = task?.id || null;
@@ -189,7 +210,8 @@ export class Engine {
       throw new AttemptBudgetError(this.config.maxAttempts);
     }
     const attempt = this.store.beginAttempt(taskID, role, settings.provider);
-    const taskDirectory = path.join(this.directory, 'tasks', taskID ? 'T' + taskID : role);
+    try {
+      const taskDirectory = path.join(this.directory, 'tasks', taskID ? 'T' + taskID : role);
     const attemptDirectory = path.join(this.directory, 'attempts', String(attempt));
     fs.mkdirSync(taskDirectory, { recursive: true });
     fs.mkdirSync(attemptDirectory, { recursive: true });
@@ -222,7 +244,6 @@ export class Engine {
     for (const instruction of instructions) this.store.delivered(instruction.id, attempt, 'included');
     this.sessions.set(attempt, { session, taskID });
     this.store.event('agent.started', { attempt, task: taskID, role, provider: settings.provider, model: settings.model, effort: settings.effort, directory: workingDirectory });
-    try {
       const result = validate(await session.run({
         prompt, schema: schemas[role], signal: this.abortController.signal,
         sessionID: role === 'worker' ? this.store.interruptedSession(taskID, settings.provider) : undefined,
@@ -233,7 +254,9 @@ export class Engine {
       this.store.event('agent.completed', { attempt, task: taskID, role });
       return { result, directory: taskDirectory };
     } catch (error) {
-      this.store.endAttempt(attempt, this.abortController.signal.aborted ? 'interrupted' : 'failed');
+      const interrupted = this.controlLeaseLost();
+      if (interrupted) this.abortController.abort();
+      this.store.endAttempt(attempt, interrupted ? 'interrupted' : 'failed');
       this.store.event('agent.failed', { attempt, task: taskID, role, reason: error.message });
       throw error;
     } finally {
@@ -336,6 +359,8 @@ export class Engine {
       if (review.decision === 'revise') { feedback = JSON.stringify(review); continue; }
       const stored = { ...candidate, review: { ...review, at: now() } };
       const committed = this.store.transaction(() => {
+        if (this.abortController.signal.aborted || this.store.getMeta('control') === 'stopped'
+            || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch) return null;
         const cutoff = Number(this.store.db.prepare("SELECT COALESCE(MAX(id),0) AS id FROM messages WHERE target='all'").get().id);
         if (cutoff !== source.message_cutoff) return false;
         if (Number.isSafeInteger(current?.revision)) this.store.setMeta(`goal:contract:${current.revision}`, current);
@@ -352,6 +377,10 @@ export class Engine {
         this.store.setMeta('report:status', { state: current ? 'stale' : 'not_started', contract_revision: revision });
         return true;
       });
+      if (committed === null) {
+        this.abortController.abort();
+        throw new Error('목표 계약을 저장하기 전에 컨트롤러가 중단됐습니다.');
+      }
       if (!committed) { source = this.goalSource(); feedback = 'The user instructions changed before the contract was stored. Rebuild it.'; continue; }
       this.store.event('goal.contract_created', { revision, requirements: stored.requirements.map(item => item.id), source_fingerprint: source.fingerprint });
       return stored;
@@ -361,16 +390,40 @@ export class Engine {
   async plan() {
     if (this.store.getMeta('planned')) return;
     const existing = path.join(this.directory, 'plan.json');
-    const plan = fs.existsSync(existing) ? validate(readJSON(existing), schemas.planner) : (await this.runAgent('planner')).result;
-    if (plan.tasks.length > this.config.maxTasks) throw new Error('계획의 초기 작업 상한 초과');
-    const seen = new Set();
-    for (const [index, task] of plan.tasks.entries()) {
-      if (task.depends_on.some(dependency => dependency < 0 || dependency >= index)) throw new Error('계획은 앞선 작업만 선행 작업으로 참조할 수 있습니다.');
-      const identity = hash(`${task.title}\n${task.brief}\n${task.scope}`.normalize('NFKC').replace(/\s+/gu, ' ').trim().toLowerCase());
-      if (seen.has(identity)) throw new Error('계획에 중복 작업이 있습니다.');
-      seen.add(identity);
+    const checkPlan = plan => {
+      if (plan.tasks.length > this.config.maxTasks) throw new Error('계획의 초기 작업 상한 초과');
+      const seen = new Set();
+      for (const [index, task] of plan.tasks.entries()) {
+        if (task.depends_on.some(dependency => dependency < 0 || dependency >= index)) throw new Error('계획은 앞선 작업만 선행 작업으로 참조할 수 있습니다.');
+        const identity = hash(`${task.title}\n${task.brief}\n${task.scope}`.normalize('NFKC').replace(/\s+/gu, ' ').trim().toLowerCase());
+        if (seen.has(identity)) throw new Error('계획에 중복 작업이 있습니다.');
+        seen.add(identity);
+      }
+      return plan;
+    };
+    let plan = null;
+    let generated = false;
+    if (fs.existsSync(existing)) {
+      try { plan = checkPlan(validate(readJSON(existing), schemas.planner)); }
+      catch (error) {
+        const quarantined = path.join(this.directory, `plan.invalid-${Date.now()}.json`);
+        fs.renameSync(existing, quarantined);
+        this.store.event('plan.invalidated', { reason: error.message, path: quarantined });
+      }
     }
-    writeJSON(existing, plan);
+    if (!plan) {
+      plan = checkPlan((await this.runAgent('planner')).result);
+      generated = true;
+    }
+    if (generated) {
+      const temporary = existing + `.tmp-${process.pid}-${crypto.randomUUID()}`;
+      try {
+        writeJSON(temporary, plan);
+        fs.renameSync(temporary, existing);
+      } finally {
+        if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+      }
+    }
     const ids = [];
     for (const [index, task] of plan.tasks.entries()) {
       const brief = { title: task.title, brief: task.brief, scope: task.scope };
@@ -388,57 +441,143 @@ export class Engine {
         const facts = this.store.listFacts({ state: 'conflicted', limit: 500 }).filter(fact => fact.key === task.brief);
         if (facts.length < 2) { this.store.updateTask(id, { state: 'accepted', feedback: '충돌이 이미 해소됐습니다.' }); return; }
         const { result } = await this.runAgent('supervisor', task, { facts });
-        this.store.applyVerdict(id, result, facts.map(fact => fact.id));
-        this.store.updateTask(id, { state: result.decision === 'reject' ? 'rejected' : result.decision === 'revise' ? 'stalled' : 'accepted', feedback: result.reason });
+        this.store.applyVerdict(id, result, facts.map(fact => fact.id), { expectedState: 'running', taskPatch: {
+          state: result.decision === 'reject' ? 'rejected' : result.decision === 'revise' ? 'stalled' : 'accepted',
+          feedback: result.reason,
+        } });
         return;
       }
       if (!task.result) {
         this.store.updateTask(id, { state: 'running' });
         const { result, directory } = await this.runAgent('worker', task, { context: this.store.context(task, this.config.contextCharacters), feedback: task.feedback });
-        this.store.submitWorker(id, result, directory, this.config.workspace);
+        if (this.store.submitWorker(id, result, directory, this.config.workspace, { expectedState: 'running' }) === null) return;
         task = this.store.task(id);
       }
       const facts = this.store.factsForTask(id).filter(fact => task.result.fact_ids.includes(fact.id));
       this.store.checkEvidence(facts);
       const { result: verdict } = await this.runAgent('supervisor', task, { facts });
-      this.store.applyVerdict(id, verdict, task.result.fact_ids);
+      const taskPatch = verdict.decision === 'accept' ? { state: 'accepted', feedback: verdict.reason }
+        : verdict.decision === 'reject' ? { state: 'rejected', feedback: verdict.reason }
+          : task.revisions >= this.config.maxRevisions ? { state: 'stalled', feedback: verdict.reason }
+            : { state: 'queued', result: null, revisions: task.revisions + 1, feedback: verdict.reason };
+      if (!this.store.applyVerdict(id, verdict, task.result.fact_ids, {
+        expectedState: 'reviewing', taskPatch,
+      })) return;
       if (verdict.decision === 'accept') {
-        this.store.updateTask(id, { state: 'accepted', feedback: verdict.reason });
         try { await this.followups(this.store.task(id)); }
         catch (error) {
           if (this.abortController.signal.aborted) throw error;
-          this.store.event('followup.failed', { task: id, reason: error.message });
+          if (error.code === 'ID2A_ATTEMPT_BUDGET') {
+            this.store.event('followup.deferred', { task: id, reason: error.message });
+          } else {
+            const failures = this.recordControlFailure('followup', error);
+            this.scheduleControlRetry('followup', failures, error);
+            this.store.event('followup.failed', { task: id, failures, reason: error.message });
+          }
         }
         this.queueConflicts();
-      } else if (verdict.decision === 'reject') this.store.updateTask(id, { state: 'rejected', feedback: verdict.reason });
-      else if (task.revisions >= this.config.maxRevisions) this.store.updateTask(id, { state: 'stalled', feedback: verdict.reason });
-      else this.store.updateTask(id, { state: 'queued', result: null, revisions: task.revisions + 1, feedback: verdict.reason });
+      }
     } catch (error) {
       const task = this.store.task(id);
-      if (this.abortController.signal.aborted) {
-        this.store.updateTask(id, { state: task.result ? 'reviewing' : 'queued', feedback: task.feedback });
+      if (!['running', 'reviewing'].includes(task.state)) {
+        this.store.event('task.attempt_discarded', { task: id, state: task.state, reason: error.message });
+        return;
+      }
+      const lostControl = this.controlLeaseLost();
+      let patch;
+      if (lostControl) {
+        this.abortController.abort();
+        patch = { state: task.result ? 'reviewing' : 'queued', feedback: task.feedback };
       } else if (error.code === 'ID2A_ATTEMPT_BUDGET') {
-        this.store.updateTask(id, { state: task.result ? 'reviewing' : 'queued', feedback: error.message });
-        this.store.event('task.deferred', { task: id, reason: 'attempt_budget', detail: error.message });
+        patch = { state: task.result ? 'reviewing' : 'queued', feedback: error.message };
       } else {
         const failures = task.failures + 1;
-        this.store.updateTask(id, { state: failures >= this.config.maxFailures ? 'stalled' : task.result ? 'reviewing' : 'queued', failures, feedback: error.message });
+        patch = { state: failures >= this.config.maxFailures ? 'stalled' : task.result ? 'reviewing' : 'queued', failures, feedback: error.message };
+      }
+      const updated = this.store.updateTask(id, patch, {
+        expectedState: task.state, expectedControlEpoch: this.controlEpoch, allowStopped: lostControl,
+      });
+      if (!updated) {
+        this.store.event('task.attempt_discarded', { task: id, state: this.store.task(id).state, reason: error.message });
+      } else if (error.code === 'ID2A_ATTEMPT_BUDGET') {
+        this.store.event('task.deferred', { task: id, reason: 'attempt_budget', detail: error.message });
       }
     }
   }
   async followups(task) {
-    if (this.store.getMeta('followups:' + task.id)) return;
+    const generation = this.followupGeneration(task);
+    if (this.followupsComplete(task, generation)) return;
     for (const candidate of task.result.followups) {
-      const signature = hash(`${task.id}\n${candidate.title}\n${candidate.brief}\n${candidate.scope}`);
-      if (this.store.getMeta('triage:' + signature)) continue;
-      const { result } = await this.runAgent('triage', task, { candidate, context: this.store.context(task, this.config.contextCharacters) });
-      this.store.setMeta('triage:' + signature, result);
+      const signature = hash(`${task.id}\n${generation}\n${candidate.title}\n${candidate.brief}\n${candidate.scope}`);
+      let result = this.store.getMeta('triage:' + signature);
+      const recovered = Boolean(result);
+      if (!result) {
+        ({ result } = await this.runAgent('triage', task, { candidate, context: this.store.context(task, this.config.contextCharacters) }));
+        this.store.setMeta('triage:' + signature, result);
+      }
       if (result.decision === 'approve') {
-        const id = this.store.addTask(candidate, { dependencies: [task.id] });
-        this.store.event(id ? 'followup.approved' : 'followup.rejected', { task: task.id, followup: id, title: candidate.title, reason: id ? result.reason : '중복 작업' });
+        const existing = this.store.existingTask(candidate);
+        let id = existing;
+        if (existing) {
+          const prior = this.store.task(existing);
+          if (['stalled', 'rejected', 'blocked', 'cancelled'].includes(prior.state)) {
+            if (prior.dependencies.length === 1 && prior.dependencies[0] === task.id) {
+              this.store.updateTask(existing, { state: 'queued', result: null, revisions: 0, failures: 0,
+                feedback: `후속 작업 세대 ${generation.slice(0, 12)}에서 다시 승인됐습니다.` });
+            } else {
+              const generatedSignature = hash(`followup:${generation}\n${candidate.title}\n${candidate.brief}\n${candidate.scope}`);
+              id = this.store.taskWithSignature(generatedSignature)
+                || this.store.addTask(candidate, { dependencies: [task.id], signature: generatedSignature });
+            }
+          }
+        } else id = this.store.addTask(candidate, { dependencies: [task.id] });
+        this.store.event('followup.approved', { task: task.id, followup: id, title: candidate.title,
+          reason: result.reason, recovered: recovered || Boolean(existing) });
       } else this.store.event('followup.rejected', { task: task.id, title: candidate.title, reason: result.reason });
     }
-    this.store.setMeta('followups:' + task.id, true);
+    this.store.transaction(() => {
+      this.store.setMeta('followups:generation:' + task.id, generation);
+      this.store.setMeta('followups:' + task.id, true);
+    });
+  }
+  followupGeneration(task) {
+    return this.store.followupGeneration(task);
+  }
+  followupsComplete(task, generation = this.followupGeneration(task)) {
+    return this.store.followupsComplete(task, generation);
+  }
+  hasPendingFollowups() {
+    return this.store.tasks().some(task => task.state === 'accepted' && task.kind === 'work'
+      && task.result?.followups?.length && !this.followupsComplete(task));
+  }
+  pendingTasks() {
+    return this.store.tasks().filter(task => ['queued', 'reviewing', 'running'].includes(task.state));
+  }
+  async recoverAcceptedFollowups() {
+    const pending = this.store.tasks().filter(item => item.state === 'accepted' && item.kind === 'work'
+      && item.result && !this.followupsComplete(item));
+    if (pending.length && !await this.honorStoredControlRetry('followup')) return false;
+    for (const task of pending) {
+      try {
+        await this.followups(task);
+      } catch (error) {
+        if (this.abortController.signal.aborted || this.store.getMeta('control') === 'stopped'
+            || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch) {
+          this.abortController.abort();
+          throw error;
+        }
+        this.store.event(error.code === 'ID2A_ATTEMPT_BUDGET' ? 'followup.deferred' : 'followup.failed', {
+          task: task.id, segment: this.store.getMeta('run:segment', 0) || 0, reason: error.message,
+        });
+        if (error.code !== 'ID2A_ATTEMPT_BUDGET') {
+          const failures = this.recordControlFailure('followup', error);
+          await this.waitForControlRetry('followup', failures, error);
+        }
+        return false;
+      }
+    }
+    if (pending.length) this.resetControlFailures('followup');
+    return true;
   }
   queueConflicts() {
     const facts = this.store.listFacts({ state: 'conflicted', limit: 500 });
@@ -521,13 +660,17 @@ export class Engine {
       if (seen.has(identity)) throw new Error('목표 후속 작업에 중복이 있습니다.');
       seen.add(identity);
       const dependencies = candidate.depends_on.map(dependency => ids[dependency]);
+      if (dependencies.some(dependency => !Number.isSafeInteger(dependency))) {
+        ids.push(null);
+        this.store.event('goal.task_skipped', { round, title: candidate.title, reason: 'excluded_dependency' });
+        continue;
+      }
       const brief = { title: candidate.title, brief: candidate.brief, scope: candidate.scope };
       const same = this.store.tasks().filter(task => task.title === candidate.title && task.brief === candidate.brief && task.scope === candidate.scope).at(-1);
       if (same?.state === 'accepted') { ids.push(same.id); continue; }
       if (same && terminal.has(same.state) && JSON.stringify(same.dependencies) === JSON.stringify(dependencies)) {
-        this.store.updateTask(same.id, { state: 'queued', result: null, revisions: 0, failures: 0, feedback: `목표 사이클 ${round} 재시도: ${reason}` });
-        scheduled.push(same.id);
-        ids.push(same.id);
+        ids.push(null);
+        this.store.event('goal.task_skipped', { round, task: same.id, title: candidate.title, reason: 'exhausted_duplicate' });
         continue;
       }
       if (same && ['queued', 'reviewing', 'running'].includes(same.state)) { scheduled.push(same.id); ids.push(same.id); continue; }
@@ -545,18 +688,25 @@ export class Engine {
     return Number(this.store.db.prepare('SELECT COALESCE(MAX(id),0) AS id FROM messages').get().id);
   }
   completionCandidate(view, contract) {
+    const source = this.goalSource();
     return {
       ledger_snapshot: view.snapshot,
       evidence_snapshot: view.evidenceSnapshot,
       message_cutoff: this.messageCutoff(),
       contract_hash: hash(JSON.stringify(contract)),
       contract_revision: contract.revision,
+      goal_source_fingerprint: source.fingerprint,
+      control_epoch: this.controlEpoch,
     };
   }
   candidateIsCurrent(candidate) {
     const contract = this.store.getMeta('goal:contract');
     const view = this.store.ledgerView();
+    const source = this.goalSource();
     return this.store.getMeta('control') === 'running'
+      && (this.store.getMeta('control:epoch', 0) || 0) === candidate.control_epoch
+      && candidate.goal_source_fingerprint === source.fingerprint
+      && contract?.source?.fingerprint === source.fingerprint
       && view.snapshot === candidate.ledger_snapshot
       && this.store.evidenceStatus(view).snapshot === candidate.evidence_snapshot
       && this.messageCutoff() === candidate.message_cutoff
@@ -640,6 +790,7 @@ export class Engine {
       contract: ['contract', 'contract_review'],
       plan: ['planner'],
       goal: ['contract', 'contract_review', 'goal', 'goal_review'],
+      followup: ['triage'],
     };
     return hash(JSON.stringify({
       source: this.goalSource().fingerprint,
@@ -659,10 +810,6 @@ export class Engine {
         || (!state.context_fingerprint && state.source_fingerprint && state.source_fingerprint !== sourceFingerprint)) {
       this.store.setMeta(`control:failures:${stage}`, { count: 0, source_fingerprint: sourceFingerprint,
         context_fingerprint: contextFingerprint, reset_at: now() });
-      return;
-    }
-    if ((state.count || 0) >= this.config.maxControlFailures) {
-      throw new Error(`${stage} 제어 단계의 누적 실패 상한(${this.config.maxControlFailures})에 도달했습니다.`);
     }
   }
   recordControlFailure(stage, error) {
@@ -680,11 +827,174 @@ export class Engine {
   resetControlFailures(stage) {
     this.store.setMeta(`control:failures:${stage}`, { count: 0, source_fingerprint: this.goalSource().fingerprint,
       context_fingerprint: this.controlFailureContext(stage), reset_at: now() });
+    this.store.setMeta(`control:retry:${stage}`, null);
   }
-  attemptBudgetConclusion() {
-    const contract = this.validateStoredContract(this.store.getMeta('goal:contract'), this.goalSource());
-    const view = this.goalContext();
+  beginSegment(reason = 'controller_started', checkpoint = null, eventType = 'run.segment_advanced') {
+    if (this.abortController.signal.aborted) return null;
+    const segment = (this.store.getMeta('run:segment', 0) || 0) + 1;
+    const startAttempt = this.store.attemptCount();
+    const startGoalRound = this.store.getMeta('goal:round', 0) || 0;
+    const startedAt = now();
+    const previous = this.store.getMeta('run:segment_state');
+    const checkpointRecord = checkpoint ? {
+      segment: previous?.id || Math.max(0, segment - 1), reason,
+      assessment: Object.hasOwn(checkpoint, 'assessment') ? checkpoint.assessment : this.store.getMeta('goal:assessment'),
+      assessment_status: checkpoint.assessmentStatus || (checkpoint.assessment ? 'evaluated' : 'assessment_not_run'),
+      candidate: checkpoint.candidate || null,
+      attempt_count: startAttempt, attempts_used: Math.max(0, startAttempt - (previous?.start_attempt ?? startAttempt)),
+      goal_round: startGoalRound, goal_rounds_used: Math.max(0, startGoalRound - (previous?.start_goal_round ?? startGoalRound)), at: startedAt,
+    } : null;
+    const state = { id: segment, start_attempt: startAttempt, start_goal_round: startGoalRound,
+      reason, phase: 'running', started_at: startedAt };
+    let replan = null;
+    let resetProgress = null;
+    if (reason === 'no_progress') {
+      const previousReplan = this.store.getMeta('goal:replan', { generation: 0 });
+      const allExcludedTaskIDs = this.store.tasks()
+        .filter(task => ['stalled', 'rejected', 'blocked', 'cancelled'].includes(task.state))
+        .map(task => task.id);
+      const excludedTaskIDs = allExcludedTaskIDs.slice(-64);
+      const progress = this.store.getMeta('goal:progress');
+      replan = { generation: (previousReplan.generation || 0) + 1,
+        last_trigger_round: startGoalRound, reason, status: 'pending', excluded_task_ids: excludedTaskIDs,
+        excluded_task_coverage: { total: allExcludedTaskIDs.length, included: excludedTaskIDs.length,
+          truncated: excludedTaskIDs.length < allExcludedTaskIDs.length }, at: startedAt };
+      if (progress) resetProgress = { ...progress, stagnant: 0,
+        strategy_generation: replan.generation, strategy_reset_at: startedAt };
+    }
+    let committed = false;
+    this.store.transaction(() => {
+      if (this.abortController.signal.aborted || this.store.getMeta('control') !== 'running'
+          || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch) return;
+      if (checkpointRecord) this.store.setMeta('run:last_checkpoint', checkpointRecord);
+      this.store.setMeta('run:segment', segment);
+      this.store.setMeta('run:segment_state', state);
+      this.store.setMeta('state', 'running');
+      this.store.setMeta('goal:outcome', 'pending');
+      this.store.setMeta('run:termination', null);
+      this.store.setMeta('goal:pending_terminal', null);
+      if (replan) {
+        this.store.setMeta('goal:replan', replan);
+        if (resetProgress) this.store.setMeta('goal:progress', resetProgress);
+        this.store.setMeta('goal:feedback', '진전이 없는 접근을 반복하지 말고, 아직 충족되지 않은 조건을 겨냥한 다른 검증·구현 경로와 실행 가능한 새 작업을 제안하세요.');
+      }
+      committed = true;
+    });
+    if (!committed) {
+      if (this.store.getMeta('control') === 'stopped') this.abortController.abort();
+      return null;
+    }
+    this.segmentStartAttempt = startAttempt;
+    this.segmentStartGoalRound = startGoalRound;
+    if (replan) {
+      this.noProgressResumeGrace = true;
+      this.store.event('goal.strategy_replanned', { generation: replan.generation,
+        round: startGoalRound, excluded_tasks: replan.excluded_task_ids,
+        excluded_task_coverage: replan.excluded_task_coverage });
+    }
+    this.store.event(eventType, { run: this.manifest.id, segment, reason,
+      previous_segment: previous?.id || null, segment_start_attempt: startAttempt,
+      max_attempts: this.config.maxAttempts, segment_start_goal_round: startGoalRound,
+      max_goal_rounds: this.config.maxGoalRounds });
+    return state;
+  }
+  setSegmentPhase(phase, extra = {}) {
+    const state = this.store.getMeta('run:segment_state');
+    if (state) this.store.setMeta('run:segment_state', { ...state, phase, ...extra });
+  }
+  scheduleControlRetry(stage, failures, error) {
+    const delay = Math.min(30000, 1000 * (2 ** Math.min(failures - 1, 5)));
+    const retryAt = new Date(Date.now() + delay).toISOString();
+    const contextFingerprint = this.controlFailureContext(stage);
+    let scheduled = false;
+    this.store.transaction(() => {
+      if (this.abortController.signal.aborted || this.store.getMeta('control') !== 'running'
+          || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch) return;
+      this.store.setMeta('state', 'retrying');
+      this.store.setMeta(`control:retry:${stage}`, { failures, reason: error.message, retry_at: retryAt,
+        context_fingerprint: contextFingerprint, at: now() });
+      scheduled = true;
+    });
+    if (!scheduled) {
+      if (this.store.getMeta('control') === 'stopped') this.abortController.abort();
+      return null;
+    }
+    this.store.event('control.retry_scheduled', { stage, failures, reason: error.message, retry_at: retryAt });
+    return { deadline: Date.parse(retryAt), contextFingerprint };
+  }
+  async waitForControlRetry(stage, failures, error, { rollover = true } = {}) {
+    const attemptBoundary = this.attemptBudgetExhausted();
+    if (rollover && (attemptBoundary || failures % this.config.maxControlFailures === 0) && !this.abortController.signal.aborted) {
+      this.beginSegment(attemptBoundary ? 'segment_budget_exhausted' : `${stage}_control_failure_window`, {
+        assessment: null,
+        assessmentStatus: 'assessment_not_run',
+        candidate: null,
+      });
+    }
+    if (this.abortController.signal.aborted) return;
+    const retry = this.scheduleControlRetry(stage, failures, error);
+    if (!retry) return;
+    const { deadline, contextFingerprint } = retry;
+    while (!this.abortController.signal.aborted && Date.now() < deadline) {
+      await this.poll();
+      if (this.controlFailureContext(stage) !== contextFingerprint) break;
+      await sleep(Math.min(250, Math.max(1, deadline - Date.now())));
+    }
+    this.store.transaction(() => {
+      if (!this.abortController.signal.aborted && this.store.getMeta('control') === 'running'
+          && (this.store.getMeta('control:epoch', 0) || 0) === this.controlEpoch) this.store.setMeta('state', 'running');
+    });
+  }
+  async honorStoredControlRetry(stage) {
+    const retry = this.store.getMeta(`control:retry:${stage}`);
+    if (!retry) return !this.abortController.signal.aborted && this.store.getMeta('control') === 'running'
+      && (this.store.getMeta('control:epoch', 0) || 0) === this.controlEpoch;
+    const contextFingerprint = this.controlFailureContext(stage);
+    if (retry.context_fingerprint !== contextFingerprint) {
+      this.store.setMeta(`control:retry:${stage}`, null);
+      return !this.abortController.signal.aborted && this.store.getMeta('control') === 'running'
+        && (this.store.getMeta('control:epoch', 0) || 0) === this.controlEpoch;
+    }
+    const deadline = Date.parse(retry.retry_at);
+    if (Number.isFinite(deadline) && deadline > Date.now()) {
+      let waiting = false;
+      this.store.transaction(() => {
+        if (this.abortController.signal.aborted || this.store.getMeta('control') !== 'running'
+            || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch) return;
+        this.store.setMeta('state', 'retrying');
+        waiting = true;
+      });
+      if (!waiting) {
+        if (this.store.getMeta('control') === 'stopped') this.abortController.abort();
+        return false;
+      }
+      this.store.event('control.retry_resumed', { stage, failures: retry.failures, retry_at: retry.retry_at });
+      while (!this.abortController.signal.aborted && Date.now() < deadline) {
+        await this.poll();
+        if (this.controlFailureContext(stage) !== contextFingerprint) break;
+        await sleep(Math.min(250, Math.max(1, deadline - Date.now())));
+      }
+    }
+    let running = false;
+    this.store.transaction(() => {
+      this.store.setMeta(`control:retry:${stage}`, null);
+      running = !this.abortController.signal.aborted && this.store.getMeta('control') === 'running'
+        && (this.store.getMeta('control:epoch', 0) || 0) === this.controlEpoch;
+      if (running) this.store.setMeta('state', 'running');
+    });
+    return running;
+  }
+  attemptBudgetCheckpoint() {
     const round = this.store.getMeta('goal:round', 0);
+    let contract;
+    try { contract = this.validateStoredContract(this.store.getMeta('goal:contract'), this.goalSource()); }
+    catch (error) {
+      this.store.event('goal.checkpoint_context_changed', { round, reason: error.message,
+        boundary: 'segment_budget_exhausted' });
+      return { kind: 'checkpoint', assessment: null, assessmentStatus: 'context_changed',
+        terminationReason: 'context_changed', candidate: null };
+    }
+    const view = this.goalContext();
     const previous = this.store.getMeta('goal:assessment');
     const expected = contract.requirements.map(requirement => requirement.id);
     const evaluated = previous?.requirement_evaluations?.map(item => item.requirement_id) || [];
@@ -692,72 +1002,66 @@ export class Engine {
       && previous.round > this.segmentStartGoalRound
       && evaluated.length === expected.length && new Set(evaluated).size === evaluated.length
       && evaluated.every(id => expected.includes(id));
-    const reason = `이번 실행 구간의 provider 호출 상한(${this.config.maxAttempts})에 도달했습니다. 목표는 완료되지 않았으며 resume하면 새 실행 구간에서 이어집니다.`;
-    const assessment = {
-      decision: 'concluded', proposed_decision: assessedThisSegment ? previous.decision : 'continue', outcome: 'not_established',
-      termination_reason: 'segment_budget_exhausted', assessment_status: assessedThisSegment ? 'evaluated' : 'assessment_not_run',
-      contract_revision: contract.revision,
-      requirement_evaluations: assessedThisSegment ? previous.requirement_evaluations
-        : contract.requirements.map(requirement => ({ requirement_id: requirement.id,
-          verdict: 'unknown', fact_ids: [], reason: '이번 실행 구간에서는 Goal 판정을 실행하지 못했습니다.' })),
-      reason, progress: assessedThisSegment ? previous.progress : '작업·사실·증거는 보존됐지만 이번 구간에서 목표 조건을 평가하지 못했습니다.',
-      next_tasks: [], question: '',
-      fact_ids: assessedThisSegment ? [...new Set(previous.requirement_evaluations.flatMap(item => item.fact_ids))].sort((a, b) => a - b) : [],
-      round, at: now(), concluded_at: now(),
-    };
+    const reason = `이번 실행 구간의 provider 호출 상한(${this.config.maxAttempts})에 도달했습니다. 체크포인트를 저장하고 다음 실행 구간을 자동으로 시작합니다.`;
+    const assessment = assessedThisSegment ? previous : null;
     const candidate = this.completionCandidate(view, contract);
-    this.store.setMeta('goal:assessment', assessment);
-    this.store.event('goal.concluded', { round, reason: 'segment_budget_exhausted', detail: reason,
-      assessment_status: assessment.assessment_status, lifetime_attempts: this.store.attemptCount(),
+    this.store.event('goal.checkpointed', { round, reason: 'segment_budget_exhausted', detail: reason,
+      assessment_status: assessedThisSegment ? 'evaluated' : 'assessment_not_run', lifetime_attempts: this.store.attemptCount(),
       segment_attempts: this.attemptBudgetUsed(), limit: this.config.maxAttempts });
-    return { kind: 'concluded', assessment, terminationReason: 'segment_budget_exhausted', candidate };
+    return { kind: 'checkpoint', assessment, assessmentStatus: assessedThisSegment ? 'evaluated' : 'assessment_not_run',
+      terminationReason: 'segment_budget_exhausted', candidate };
   }
-  goalRoundBudgetConclusion() {
-    const contract = this.validateStoredContract(this.store.getMeta('goal:contract'), this.goalSource());
-    const view = this.goalContext();
+  goalRoundBudgetCheckpoint() {
     const round = this.store.getMeta('goal:round', 0);
+    let contract;
+    try { contract = this.validateStoredContract(this.store.getMeta('goal:contract'), this.goalSource()); }
+    catch (error) {
+      this.store.event('goal.checkpoint_context_changed', { round, reason: error.message,
+        boundary: 'goal_round_limit' });
+      return { kind: 'checkpoint', assessment: null, assessmentStatus: 'context_changed',
+        terminationReason: 'context_changed', candidate: null };
+    }
+    const view = this.goalContext();
     const previous = this.store.getMeta('goal:assessment');
     const expected = contract.requirements.map(requirement => requirement.id);
     const evaluated = previous?.requirement_evaluations?.map(item => item.requirement_id) || [];
     const validPrevious = previous?.contract_revision === contract.revision
       && evaluated.length === expected.length && new Set(evaluated).size === evaluated.length
       && evaluated.every(id => expected.includes(id));
-    const reason = `이번 실행 구간의 Goal 판정 상한(${this.config.maxGoalRounds})에 도달했습니다. 목표는 완료되지 않았으며 resume하면 새 실행 구간에서 이어집니다.`;
-    const assessment = {
-      decision: 'concluded', proposed_decision: validPrevious ? previous.decision : 'continue', outcome: 'not_established',
-      termination_reason: 'goal_round_limit', assessment_status: validPrevious ? 'evaluated' : 'assessment_not_run',
-      contract_revision: contract.revision,
-      requirement_evaluations: validPrevious ? previous.requirement_evaluations
-        : contract.requirements.map(requirement => ({ requirement_id: requirement.id,
-          verdict: 'unknown', fact_ids: [], reason: '이번 실행 구간에서는 이 조건을 평가하지 못했습니다.' })),
-      reason, progress: validPrevious ? previous.progress : '작업·사실·증거는 보존됐지만 이번 구간에서 목표 조건을 평가하지 못했습니다.',
-      next_tasks: [], question: '',
-      fact_ids: validPrevious ? [...new Set(previous.requirement_evaluations.flatMap(item => item.fact_ids))].sort((a, b) => a - b) : [],
-      round, at: now(), concluded_at: now(),
-    };
+    const reason = `이번 실행 구간의 Goal 판정 상한(${this.config.maxGoalRounds})에 도달했습니다. 체크포인트를 저장하고 다음 실행 구간을 자동으로 시작합니다.`;
+    const assessment = validPrevious ? previous : null;
     const candidate = this.completionCandidate(view, contract);
-    this.store.setMeta('goal:assessment', assessment);
-    this.store.event('goal.concluded', { round, reason: 'goal_round_limit', detail: reason,
+    this.store.event('goal.checkpointed', { round, reason: 'goal_round_limit', detail: reason,
       segment_rounds: Math.max(0, round - this.segmentStartGoalRound), lifetime_rounds: round, limit: this.config.maxGoalRounds });
-    return { kind: 'concluded', assessment, terminationReason: 'goal_round_limit', candidate };
+    return { kind: 'checkpoint', assessment, assessmentStatus: validPrevious ? 'evaluated' : 'assessment_not_run',
+      terminationReason: 'goal_round_limit', candidate };
   }
   async segmentBudgetOutcome() {
-    if (this.store.getMeta('planned') && !this.goalRoundBudgetExhausted()) {
+    const pendingWork = this.store.tasks().some(task => ['queued', 'reviewing', 'running'].includes(task.state))
+      || this.hasPendingFollowups();
+    if (this.store.getMeta('planned') && !pendingWork && !this.goalRoundBudgetExhausted()) {
       try {
+        if (!await this.honorStoredControlRetry('goal')) return { kind: 'changed' };
         this.assertControlBudget('goal');
         await this.ensureGoalContract();
+        if (this.pendingTasks().length || this.hasPendingFollowups()) return this.attemptBudgetCheckpoint();
         const checkpoint = await this.assessGoal();
         this.resetControlFailures('goal');
-        if (checkpoint.kind === 'achieved' || checkpoint.kind === 'concluded') return checkpoint;
+        if (['achieved', 'checkpoint', 'waiting', 'changed'].includes(checkpoint.kind)) return checkpoint;
         this.store.event('goal.segment_checkpoint', { kind: checkpoint.kind,
           round: this.store.getMeta('goal:round', 0), segment_attempts: this.attemptBudgetUsed() });
       } catch (error) {
-        if (this.abortController.signal.aborted) throw error;
+        if (this.abortController.signal.aborted || this.store.getMeta('control') === 'stopped'
+            || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch) {
+          this.abortController.abort();
+          throw error;
+        }
         const failures = error.code === 'ID2A_ATTEMPT_BUDGET' ? null : this.recordControlFailure('goal', error);
         this.store.event('goal.segment_checkpoint_failed', { reason: error.message, ...(failures === null ? {} : { failures }) });
+        if (failures !== null) await this.waitForControlRetry('goal', failures, error, { rollover: false });
       }
     }
-    return this.attemptBudgetConclusion();
+    return this.attemptBudgetCheckpoint();
   }
   validateGoalAssessment(result, contract, view) {
     if (result.contract_revision !== contract.revision) throw new Error('목표 판정의 계약 revision이 현재 계약과 다릅니다.');
@@ -834,15 +1138,16 @@ export class Engine {
     return false;
   }
   concludeAssessment(assessment, terminationReason, candidate) {
-    const concluded = { ...assessment, proposed_decision: assessment.decision, decision: 'concluded',
-      outcome: 'not_established', termination_reason: terminationReason, assessment_status: 'evaluated', concluded_at: now() };
-    this.store.setMeta('goal:assessment', concluded);
-    this.store.event('goal.concluded', { round: assessment.round, reason: terminationReason, detail: assessment.reason });
-    return { kind: 'concluded', assessment: concluded, terminationReason, candidate };
+    this.store.event('goal.checkpointed', { round: assessment.round, reason: terminationReason, detail: assessment.reason });
+    return { kind: 'checkpoint', assessment, assessmentStatus: 'evaluated', terminationReason, candidate };
   }
   async assessGoal() {
-    const contract = this.store.getMeta('goal:contract');
-    if (!contract) throw new Error('목표 계약이 없습니다.');
+    let contract;
+    try { contract = this.validateStoredContract(this.store.getMeta('goal:contract'), this.goalSource()); }
+    catch (error) {
+      this.store.event('goal.changed_before_assessment', { reason: error.message });
+      return { kind: 'changed' };
+    }
     const beforeMessage = this.messageCutoff();
     const round = this.store.getMeta('goal:round', 0) + 1;
     const view = this.goalContext();
@@ -858,6 +1163,7 @@ export class Engine {
         conflicts: view.conflicted.map(({ id, key, claim }) => ({ id, key, claim })),
         previous_assessment: this.store.getMeta('goal:assessment'),
         controller_feedback: this.store.getMeta('goal:feedback', ''),
+        replan: this.store.getMeta('goal:replan'),
         current_source: sourceIdentity(this.config.workspace),
       },
     });
@@ -874,11 +1180,11 @@ export class Engine {
       this.store.setMeta('goal:round', round);
       this.store.setMeta('goal:assessment', assessment);
       this.store.setMeta('goal:feedback', feedback);
-      this.store.setMeta('state', 'running');
+      if (!this.setControllerState('running')) return { kind: 'changed' };
       this.store.event('goal.input_bypassed', { round, question: result.question, reason: result.reason });
       const progress = this.progressState(assessment);
-      if (this.goalRoundBudgetExhausted(round)) return this.concludeAssessment(assessment, 'goal_round_limit', candidate);
       if (this.noProgressLimitReached(progress)) return this.concludeAssessment(assessment, 'no_progress', candidate);
+      if (this.goalRoundBudgetExhausted(round)) return this.concludeAssessment(assessment, 'goal_round_limit', candidate);
       return { kind: 'retry' };
     }
     this.store.setMeta('goal:round', round);
@@ -902,26 +1208,35 @@ export class Engine {
       if (review.decision === 'reject') {
         this.store.setMeta('goal:feedback', `독립 완료 검토가 달성 후보를 거절했습니다: ${review.reason}`);
         this.store.event('goal.achievement_rejected', { round, reason: review.reason });
+        const progress = this.progressState(assessment);
+        if (this.noProgressLimitReached(progress)) return this.concludeAssessment(assessment, 'no_progress', candidate);
         if (this.goalRoundBudgetExhausted(round)) return this.concludeAssessment(assessment, 'goal_round_limit', candidate);
         return { kind: 'retry' };
       }
       return { kind: 'achieved', assessment, candidate };
     }
     if (result.decision === 'needs_input') {
-      this.store.setMeta('state', 'waiting_input');
+      if (!this.setControllerState('waiting_input')) return { kind: 'changed' };
       this.store.event('goal.waiting_input', { round, question: result.question });
       return { kind: 'waiting', marker: beforeMessage };
     }
     const progress = this.progressState(assessment);
-    if (this.noProgressLimitReached(progress)) return this.concludeAssessment(assessment, 'no_progress', candidate);
     const scheduled = this.queueGoalTasks(result.next_tasks, round, result.reason);
+    if (this.noProgressLimitReached(progress)) {
+      if (scheduled.length) this.store.event('goal.replan_tasks_preserved', { round, tasks: scheduled });
+      const checkpointCandidate = scheduled.length ? this.completionCandidate(this.goalContext(), contract) : candidate;
+      return this.concludeAssessment(assessment, 'no_progress', checkpointCandidate);
+    }
     if (!scheduled.length) {
       const feedback = '계속 판정이 실행 가능한 새 작업을 만들지 못했습니다. 완료된 작업을 반복하지 말고 다른 구체적 접근을 제안하세요.';
       this.store.setMeta('goal:feedback', feedback);
       this.store.event('goal.replan_required', { round, reason: feedback });
       return { kind: 'retry' };
     }
-    this.store.setMeta('state', 'running');
+    if (!this.setControllerState('running')) return { kind: 'changed' };
+    this.noProgressResumeGrace = false;
+    const replan = this.store.getMeta('goal:replan');
+    if (replan?.status === 'pending') this.store.setMeta('goal:replan', { ...replan, status: 'scheduled', tasks: scheduled, scheduled_at: now() });
     this.store.event('goal.continued', { round, tasks: scheduled });
     if (this.goalRoundBudgetExhausted(round)) {
       const queuedCandidate = this.completionCandidate(this.goalContext(), contract);
@@ -933,8 +1248,8 @@ export class Engine {
     while (!this.abortController.signal.aborted) {
       await this.poll();
       if (this.store.getMeta('control') === 'paused') { await sleep(300); continue; }
-      if (this.store.readyTasks().length || this.messageCutoff() > marker) {
-        this.store.setMeta('state', 'running');
+      if (this.store.readyTasks().length || this.messageCutoff() > marker || this.config.inputPolicy === 'continue') {
+        if (!this.setControllerState('running')) return;
         this.store.event('goal.resumed', { after_message: marker });
         return;
       }
@@ -956,7 +1271,20 @@ export class Engine {
       }
     }
   }
+  async finishCompletion(candidate, reportID, reason) {
+    while (true) {
+      if (this.store.finishCompletedRun(candidate, reportID)) return 'completed';
+      if (this.controlLeaseLost()) return 'stopped';
+      if (this.store.getMeta('control') === 'paused') {
+        await sleep(200);
+        continue;
+      }
+      this.store.reopenGoalOutcome(candidate, reportID, reason);
+      return 'changed';
+    }
+  }
   async report(outcome) {
+    if (outcome.kind !== 'achieved') throw new Error('최종 보고서는 목표 달성이 승인된 경우에만 생성할 수 있습니다.');
     const { assessment, candidate } = outcome;
     const goalOutcome = outcome.kind === 'achieved' ? 'achieved' : 'not_established';
     const terminationReason = outcome.kind === 'achieved' ? 'goal_achieved' : outcome.terminationReason;
@@ -972,7 +1300,8 @@ export class Engine {
     }
     const editorConfiguration = { ...this.settings('editor'), timeout: this.config.timeout, permissions: this.config.permissions,
       codexBin: this.config.codexBin || null, claudeBin: this.config.claudeBin || null };
-    const reportID = hash(JSON.stringify({ candidate, goalOutcome, terminationReason, assessment, editorConfiguration }));
+    const { control_epoch: _leaseEpoch, ...reportCandidate } = candidate;
+    const reportID = hash(JSON.stringify({ candidate: reportCandidate, goalOutcome, terminationReason, assessment, editorConfiguration }));
     this.store.setMeta('report:status', { state: 'generating', id: reportID, contract_revision: contract.revision, assessment_round: assessment.round });
     const validateEditor = result => {
       if (new Set(result.fact_ids).size !== result.fact_ids.length || result.fact_ids.some(id => !facts.some(fact => fact.id === id))) throw new Error('최종 보고서에 중복 또는 검증되지 않은 사실 인용');
@@ -1025,11 +1354,7 @@ export class Engine {
       assessment_round: assessment.round,
       generation: controllerCheckpoint ? 'controller_checkpoint' : editorError ? 'controller_fallback' : 'editor',
       ...(editorError ? { editor_error: editorError } : {}) };
-    if (!this.store.commitGoalOutcome(candidate, { outcome: goalOutcome, termination, assessment, report: generating })) {
-      this.store.setMeta('goal:pending_terminal', null);
-      return 'changed';
-    }
-    const manifest = { format_version: 4, goal_format_version: this.store.getMeta('goal:format_version', 0),
+    const manifest = { format_version: 5, goal_format_version: this.store.getMeta('goal:format_version', 0),
       run: this.manifest.id, state, execution: { state }, goal_outcome: goalOutcome,
       termination, report: generating, contract, source: this.manifest.source, current_source: sourceIdentity(this.config.workspace),
       goal: assessment, tasks, facts, conflicts: conflicted, editor, ended: now() };
@@ -1045,39 +1370,65 @@ export class Engine {
     }
     if (conflicted.length) lines.push('', '## 해결되지 않은 충돌', '', ...conflicted.map(fact => `- F${fact.id} ${fact.key}: ${fact.claim}`));
     const reportPath = path.join(this.directory, 'report.md');
+    const complete = { ...generating, state: 'complete', path: reportPath, completed_at: now() };
+    let finalReport = complete;
+    let writeError = null;
     try {
-      this.writeResult(manifest);
       fs.writeFileSync(reportPath, lines.join('\n') + '\n', 'utf8');
-      const complete = { ...generating, state: 'complete', path: reportPath, completed_at: now() };
-      this.writeResult({ ...manifest, report: complete });
-      this.store.setMeta('report:status', complete);
+    } catch (error) {
+      writeError = error;
+      finalReport = { ...generating, state: 'failed', reason: error.message, failed_at: now() };
+    }
+    if (!this.store.commitGoalOutcome(candidate, { outcome: goalOutcome, termination, assessment, report: finalReport })) {
+      if (this.abortController.signal.aborted || this.store.getMeta('control') === 'stopped'
+          || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch) return 'stopped';
+      this.store.setMeta('report:status', { ...generating, state: 'stale', reason: 'context_changed' });
+      this.store.setMeta('goal:pending_terminal', null);
+      return 'changed';
+    }
+    if (this.abortController.signal.aborted || this.store.getMeta('control') === 'stopped'
+        || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch) return 'stopped';
+    if (!this.candidateIsCurrent(candidate)) {
+      this.store.reopenGoalOutcome(candidate, reportID, 'context_changed_after_commit');
+      return 'changed';
+    }
+    if (writeError) {
+      let resultError = null;
+      try { this.writeResult({ ...manifest, report: finalReport }); }
+      catch (error) { resultError = error.message; }
+      this.store.event('report.write_failed', { reason: writeError.message, goal_outcome: goalOutcome,
+        ...(resultError ? { result_error: resultError } : {}) });
+    } else {
+      try { this.writeResult({ ...manifest, report: complete }); }
+      catch (error) {
+        const failed = { ...generating, state: 'failed', reason: error.message, failed_at: now() };
+        this.store.updateCommittedReport(candidate, reportID, failed);
+        let resultError = null;
+        try { this.writeResult({ ...manifest, report: failed }); }
+        catch (retryError) { resultError = retryError.message; }
+        this.store.event('report.write_failed', { reason: error.message, goal_outcome: goalOutcome,
+          ...(resultError ? { result_error: resultError } : {}) });
+      }
+    }
+    const finalized = await this.finishCompletion(candidate, reportID, 'context_changed_after_publish');
+    if (finalized !== 'completed') return finalized;
+    if (!writeError && this.store.getMeta('report:status')?.state === 'complete') {
       this.store.event(state === 'completed' ? 'run.finished' : 'run.suspended', {
         state, goal_outcome: goalOutcome, termination_reason: terminationReason,
         tasks: tasks.length, verified: facts.length, report: reportPath,
       });
-    } catch (error) {
-      const failed = { ...generating, state: 'failed', reason: error.message, failed_at: now() };
-      this.store.setMeta('report:status', failed);
-      let resultError = null;
-      try { this.writeResult({ ...manifest, report: failed }); }
-      catch (writeError) { resultError = writeError.message; }
-      this.store.event('report.write_failed', { reason: error.message, goal_outcome: goalOutcome,
-        ...(resultError ? { result_error: resultError } : {}) });
     }
     return state;
   }
   async resumeTerminalReport(outcome, eventType) {
-    this.store.setMeta('control', 'running');
-    this.store.setMeta('state', 'running');
     this.store.event(eventType, { kind: outcome.kind, round: outcome.assessment.round });
     const ticker = setInterval(() => this.poll().catch(error => this.store.event('controller.warning', { reason: error.message })), 300);
     try { return await this.report(outcome); }
     catch (error) {
-      if (this.abortController.signal.aborted) {
-        this.store.setMeta('state', 'stopped');
-        this.store.setMeta('run:termination', { reason: 'user_stopped', at: now() });
-        const report = this.store.getMeta('report:status', { state: 'not_started' });
-        if (report.state === 'generating') this.store.setMeta('report:status', { ...report, state: 'stale', reason: 'user_stopped' });
+      if (this.abortController.signal.aborted || this.store.getMeta('control') === 'stopped'
+          || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch) {
+        this.abortController.abort();
+        this.store.commitStopped('report', { fence: false });
         this.store.event('run.stopped', { resume: this.directory, stage: 'report' });
         return 'stopped';
       }
@@ -1090,6 +1441,21 @@ export class Engine {
       while (this.polling) await sleep(10);
     }
   }
+  async continueAcrossSegment(outcome, fallbackReason) {
+    if (outcome?.kind === 'achieved') {
+      const reported = await this.report(outcome);
+      if (reported !== 'changed') return reported;
+      this.beginSegment('context_changed');
+      return null;
+    }
+    if (outcome?.kind === 'waiting') {
+      await this.waitForInstruction(outcome.marker);
+      if (this.abortController.signal.aborted) return null;
+    }
+    const reason = outcome?.terminationReason || (outcome?.kind === 'changed' ? 'context_changed' : fallbackReason);
+    this.beginSegment(reason, outcome?.kind === 'changed' ? null : outcome);
+    return null;
+  }
   async run() {
     const source = sourceIdentity(this.config.workspace);
     const expected = this.store.getMeta('source:current', this.manifest.source);
@@ -1097,6 +1463,38 @@ export class Engine {
     if (JSON.stringify(source) !== JSON.stringify(expected)) this.store.event('workspace.external_change', { expected, current: source });
     this.store.setMeta('source:current', source);
     const previousStatus = this.store.completionStatus();
+    let expectedControl = this.initialControl;
+    let expectedControlRevision = this.controlRevision;
+    let claimedEpoch = null;
+    while (claimedEpoch === null) {
+      claimedEpoch = this.store.claimRunning(this.controlEpoch, expectedControl, expectedControlRevision);
+      if (claimedEpoch !== null) break;
+      const currentEpoch = this.store.getMeta('control:epoch', 0) || 0;
+      const currentControl = this.store.getMeta('control');
+      const currentControlRevision = this.store.getMeta('control:revision', 0) || 0;
+      if (this.abortController.signal.aborted || currentEpoch !== this.controlEpoch) {
+        this.abortController.abort();
+        return 'stopped';
+      }
+      if (currentControl === 'paused') {
+        await sleep(200);
+        expectedControl = 'running';
+        expectedControlRevision = currentControlRevision;
+        continue;
+      }
+      expectedControl = currentControl;
+      expectedControlRevision = currentControlRevision;
+    }
+    this.controlEpoch = claimedEpoch;
+    this.store.transaction(() => {
+      const pending = this.store.getMeta('goal:pending_terminal');
+      if (pending?.candidate) this.store.setMeta('goal:pending_terminal', {
+        ...pending, candidate: { ...pending.candidate, control_epoch: claimedEpoch },
+      });
+      const candidate = this.store.getMeta('goal:candidate');
+      if (candidate) this.store.setMeta('goal:candidate', { ...candidate, control_epoch: claimedEpoch });
+    });
+    this.store.recover();
     const pendingTerminal = this.pendingTerminalOutcome();
     if (pendingTerminal && this.terminalLimitStillApplies(pendingTerminal)) {
       const resumed = await this.resumeTerminalReport(pendingTerminal, 'report.resume_pending');
@@ -1108,14 +1506,18 @@ export class Engine {
     }
     const reusableTerminal = this.reusableTerminalOutcome(previousStatus);
     if (reusableTerminal && this.terminalLimitStillApplies(reusableTerminal)) {
-      this.store.setMeta('control', 'running');
       if (this.completedReportIsCurrent(previousStatus)) {
-        this.store.event('run.resume_noop', { goal_outcome: previousStatus.goal_outcome,
-          termination_reason: previousStatus.termination?.reason });
-        return 'completed';
+        const finalized = await this.finishCompletion(reusableTerminal.candidate, previousStatus.report.id, 'context_changed_during_resume');
+        if (finalized === 'completed') {
+          this.store.event('run.resume_noop', { goal_outcome: previousStatus.goal_outcome,
+            termination_reason: previousStatus.termination?.reason });
+          return 'completed';
+        }
+        if (finalized === 'stopped') return 'stopped';
+      } else {
+        const repaired = await this.resumeTerminalReport(reusableTerminal, 'report.retry');
+        if (repaired !== 'changed') return repaired;
       }
-      const repaired = await this.resumeTerminalReport(reusableTerminal, 'report.retry');
-      if (repaired !== 'changed') return repaired;
     } else if (reusableTerminal) {
       this.store.event('run.resume_suspended', { termination_reason: reusableTerminal.terminationReason,
         previous_round: reusableTerminal.assessment.round });
@@ -1125,21 +1527,32 @@ export class Engine {
       history.push({ ...previousStatus, recorded_at: now(), assessment: this.store.getMeta('goal:assessment') });
       this.store.setMeta('run:history', history.slice(-100));
     }
-    this.store.recover();
-    this.store.setMeta('control', 'running');
-    this.store.setMeta('state', 'running');
-    this.store.setMeta('goal:outcome', 'pending');
-    this.store.setMeta('run:termination', null);
-    const previousReport = this.store.getMeta('report:status', { state: 'not_started' });
-    if (['complete', 'failed', 'generating'].includes(previousReport.state)) this.store.setMeta('report:status', { ...previousReport, state: 'stale' });
-    const segment = (this.store.getMeta('run:segment', 0) || 0) + 1;
-    this.store.setMeta('run:segment', segment);
-    this.store.event('run.started', { run: this.manifest.id, segment,
-      segment_start_attempt: this.segmentStartAttempt, max_attempts: this.config.maxAttempts,
-      segment_start_goal_round: this.segmentStartGoalRound, max_goal_rounds: this.config.maxGoalRounds });
+    let prepared = false;
+    while (!prepared) {
+      this.store.transaction(() => {
+        if (this.store.getMeta('control') !== 'running'
+            || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch) return;
+        this.store.setMeta('state', 'running');
+        this.store.setMeta('goal:outcome', 'pending');
+        this.store.setMeta('run:termination', null);
+        const previousReport = this.store.getMeta('report:status', { state: 'not_started' });
+        if (['complete', 'failed', 'generating'].includes(previousReport.state)) this.store.setMeta('report:status', { ...previousReport, state: 'stale' });
+        prepared = true;
+      });
+      if (prepared) break;
+      if (this.controlLeaseLost()) {
+        this.abortController.abort();
+        return 'stopped';
+      }
+      await sleep(200);
+    }
+    this.beginSegment(previousStatus.execution_state === 'created' ? 'controller_started' : 'controller_resumed', null, 'run.started');
     const ticker = setInterval(() => this.poll().catch(error => this.store.event('controller.warning', { reason: error.message })), 300);
     try {
       while (!this.abortController.signal.aborted) {
+        await this.poll();
+        if (this.store.getMeta('control') === 'paused') { await sleep(200); continue; }
+        if (!await this.honorStoredControlRetry('contract')) continue;
         this.assertControlBudget('contract');
         try {
           await this.ensureGoalContract();
@@ -1147,52 +1560,59 @@ export class Engine {
           break;
         }
         catch (error) {
+          if (this.abortController.signal.aborted || this.store.getMeta('control') === 'stopped'
+              || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch) throw error;
           if (error.code === 'ID2A_ATTEMPT_BUDGET') throw error;
           const contractFailures = this.recordControlFailure('contract', error);
-          this.store.setMeta('state', 'retrying');
           this.store.event('goal.contract_retry', { failures: contractFailures, reason: error.message });
-          if (contractFailures >= this.config.maxControlFailures) throw error;
-          await sleep(Math.min(30000, 1000 * (2 ** Math.min(contractFailures - 1, 5))));
+          await this.waitForControlRetry('contract', contractFailures, error);
         }
       }
-      this.store.setMeta('state', 'running');
+      this.setControllerState('running');
       while (!this.store.getMeta('planned') && !this.abortController.signal.aborted) {
+        await this.poll();
+        if (this.store.getMeta('control') === 'paused') { await sleep(200); continue; }
         if (this.attemptBudgetExhausted()) {
-          const reported = await this.report(await this.segmentBudgetOutcome());
-          if (reported === 'changed') throw new AttemptBudgetError(this.config.maxAttempts);
-          return reported;
+          const reported = await this.continueAcrossSegment(await this.segmentBudgetOutcome(), 'segment_budget_exhausted');
+          if (reported) return reported;
+          continue;
         }
+        if (!await this.honorStoredControlRetry('plan')) continue;
         this.assertControlBudget('plan');
         try {
           await this.plan();
           this.resetControlFailures('plan');
         }
         catch (error) {
+          if (this.abortController.signal.aborted || this.store.getMeta('control') === 'stopped'
+              || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch) throw error;
           if (error.code === 'ID2A_ATTEMPT_BUDGET') {
-            const reported = await this.report(await this.segmentBudgetOutcome());
-            if (reported === 'changed') throw error;
-            return reported;
+            const reported = await this.continueAcrossSegment(await this.segmentBudgetOutcome(), 'segment_budget_exhausted');
+            if (reported) return reported;
+            continue;
           }
           const planFailures = this.recordControlFailure('plan', error);
-          this.store.setMeta('state', 'retrying');
           this.store.event('plan.retry', { failures: planFailures, reason: error.message });
-          if (planFailures >= this.config.maxControlFailures) throw error;
-          await sleep(Math.min(30000, 1000 * (2 ** Math.min(planFailures - 1, 5))));
+          await this.waitForControlRetry('plan', planFailures, error);
         }
-      }
-      // Followups interrupted after a task was accepted must not be lost on resume.
-      for (const task of this.store.tasks().filter(task => task.state === 'accepted' && task.kind === 'work')) {
-        try { await this.followups(task); }
-        catch (error) { this.store.event('followup.failed', { task: task.id, reason: error.message }); }
       }
       this.queueConflicts();
       while (!this.abortController.signal.aborted) {
         await this.poll();
         if (this.store.getMeta('control') === 'paused') { await sleep(200); continue; }
         if (!this.activeTasks.size && this.attemptBudgetExhausted()) {
-          const reported = await this.report(await this.segmentBudgetOutcome());
-          if (reported === 'changed') throw new AttemptBudgetError(this.config.maxAttempts);
-          return reported;
+          const reported = await this.continueAcrossSegment(await this.segmentBudgetOutcome(), 'segment_budget_exhausted');
+          if (reported) return reported;
+          continue;
+        }
+        if (!this.activeTasks.size) {
+          const followupsReady = await this.recoverAcceptedFollowups();
+          if (this.attemptBudgetExhausted()) {
+            const reported = await this.continueAcrossSegment(await this.segmentBudgetOutcome(), 'segment_budget_exhausted');
+            if (reported) return reported;
+            continue;
+          }
+          if (!followupsReady || this.hasPendingFollowups()) continue;
         }
         if (!this.activeTasks.size && this.store.tasks().some(task => task.state === 'accepted')) await this.curate(false);
         const ready = this.store.readyTasks().filter(task => !this.activeTasks.has(task.id));
@@ -1204,41 +1624,61 @@ export class Engine {
         if (!this.activeTasks.size) {
           const waiting = this.store.tasks().filter(task => ['queued', 'reviewing', 'running'].includes(task.state));
           if (waiting.length) {
-            for (const task of waiting) this.store.updateTask(task.id, { state: 'blocked', feedback: '선행 작업을 충족하는 실행 경로 없음' });
+            // readyTasks() alone decides whether terminal dependencies make a
+            // task impossible. Work added after the earlier ready snapshot must
+            // remain queued for the next scheduler pass.
+            await sleep(100);
+            continue;
           }
           await this.curate(true);
           if (this.store.readyTasks().length || this.store.getMeta('control') !== 'running') continue;
           let outcome;
           try {
+            if (!await this.honorStoredControlRetry('goal')) continue;
             this.assertControlBudget('goal');
             await this.ensureGoalContract();
+            const pendingTasks = this.pendingTasks();
+            const pendingFollowups = this.hasPendingFollowups();
+            if (pendingTasks.length || pendingFollowups) {
+              this.resetControlFailures('goal');
+              this.store.event('goal.deferred_for_pending_work', {
+                pending_tasks: pendingTasks.map(task => task.id),
+                pending_followups: pendingFollowups,
+              });
+              continue;
+            }
             outcome = this.goalRoundBudgetExhausted()
-              ? this.goalRoundBudgetConclusion()
+              ? this.goalRoundBudgetCheckpoint()
               : await this.assessGoal();
             this.resetControlFailures('goal');
           } catch (error) {
+            if (this.abortController.signal.aborted || this.store.getMeta('control') === 'stopped'
+                || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch) throw error;
             if (error.code === 'ID2A_ATTEMPT_BUDGET') {
-              const reported = await this.report(await this.segmentBudgetOutcome());
-              if (reported === 'changed') throw error;
-              return reported;
+              const reported = await this.continueAcrossSegment(await this.segmentBudgetOutcome(), 'segment_budget_exhausted');
+              if (reported) return reported;
+              continue;
             }
             const goalFailures = this.recordControlFailure('goal', error);
-            this.store.setMeta('state', 'retrying');
             this.store.setMeta('goal:feedback', error.message);
             this.store.event('goal.retry', { failures: goalFailures, reason: error.message });
-            if (goalFailures >= this.config.maxControlFailures) throw error;
-            await sleep(Math.min(30000, 1000 * (2 ** Math.min(goalFailures - 1, 5))));
+            await this.waitForControlRetry('goal', goalFailures, error);
             continue;
           }
           if (outcome.kind === 'changed') continue;
           if ((outcome.kind === 'continue' || outcome.kind === 'retry') && this.attemptBudgetExhausted()) {
-            const reported = await this.report(this.attemptBudgetConclusion());
-            if (reported === 'changed') continue;
-            return reported;
+            const reported = await this.continueAcrossSegment(this.attemptBudgetCheckpoint(), 'segment_budget_exhausted');
+            if (reported) return reported;
+            continue;
           }
           if (outcome.kind === 'continue') continue;
           if (outcome.kind === 'retry') { await sleep(1000); continue; }
           if (outcome.kind === 'waiting') { await this.waitForInstruction(outcome.marker); continue; }
+          if (outcome.kind === 'checkpoint') {
+            const reported = await this.continueAcrossSegment(outcome, outcome.terminationReason);
+            if (reported) return reported;
+            continue;
+          }
           const reported = await this.report(outcome);
           if (reported === 'changed') continue;
           return reported;
@@ -1246,21 +1686,21 @@ export class Engine {
         await sleep(100);
       }
       await Promise.allSettled(this.activeTasks.values());
-      this.store.setMeta('state', 'stopped');
-      this.store.setMeta('run:termination', { reason: 'user_stopped', at: now() });
+      this.store.commitStopped(null, { fence: false });
       this.store.event('run.stopped', { resume: this.directory });
       return 'stopped';
     } catch (error) {
-      if (this.abortController.signal.aborted) {
+      if (this.abortController.signal.aborted || this.store.getMeta('control') === 'stopped'
+          || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch) {
+        this.abortController.abort();
         await Promise.allSettled(this.activeTasks.values());
-        this.store.setMeta('state', 'stopped');
-        this.store.setMeta('run:termination', { reason: 'user_stopped', at: now() });
-        const report = this.store.getMeta('report:status', { state: 'not_started' });
-        if (report.state === 'generating') this.store.setMeta('report:status', { ...report, state: 'stale', reason: 'user_stopped' });
+        this.store.commitStopped(null, { fence: false });
+        this.store.event('run.stopped', { resume: this.directory });
         return 'stopped';
       }
       this.store.setMeta('state', 'failed');
       this.store.setMeta('run:termination', { reason: 'controller_error', at: now(), detail: error.message });
+      this.setSegmentPhase('failed', { ended_at: now(), termination_reason: 'controller_error' });
       this.store.event('run.failed', { reason: error.message });
       throw error;
     } finally {

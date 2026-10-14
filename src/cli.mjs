@@ -57,7 +57,7 @@ start: 초기 프롬프트를 여러 줄로 붙여 넣고 마지막에 /end를 �
        --max-tasks 8  --max-revisions 2  --max-goal-rounds 12  --max-no-progress 3
        --max-control-failures 5  --max-attempts 100  --timeout 1200  --no-interactive  --json
        --max-tasks는 전체 종료 한도가 아니라 한 목표 사이클이 제안할 수 있는 작업 상한입니다.
-       호출·Goal 한도는 실행 구간 기준이며, suspended run을 resume하면 새 구간에서 계속합니다.
+       호출·Goal·무진전 한도는 종료 조건이 아니라 체크포인트 주기입니다. 목표 달성 또는 명시적 stop까지 새 구간을 자동으로 이어갑니다.
        --config config.json으로 역할별 provider/model/effort도 지정할 수 있습니다.
 
 latest와 list는 기본적으로 현재 폴더를 workspace로 사용하는 run만 찾습니다.
@@ -100,6 +100,8 @@ function summary(store) {
     state: completion.execution_state,
     control: completion.execution_state === 'suspended' ? 'paused' : store.getMeta('control'),
     goal_outcome: completion.goal_outcome, termination: completion.termination, report: completion.report,
+    segment: store.getMeta('run:segment_state'), checkpoint: store.getMeta('run:last_checkpoint'),
+    replan: store.getMeta('goal:replan'),
     contract: store.getMeta('goal:contract'), goal: store.getMeta('goal:assessment'), counts,
     facts: store.listFacts({ limit: 500 }).map(({ id, key, state }) => ({ id, key, state })),
     tasks: tasks.map(({ id, title, state, revisions, failures, feedback }) => ({ id, title, state, revisions, failures, feedback })) };
@@ -135,6 +137,9 @@ function renderEvent(event, rl) {
   else if (event.type === 'agent.started') console.log(`[${event.role}${event.task ? ':T' + event.task : ''}] ${event.provider}, model=${event.model || 'CLI 기본'}, effort=${event.effort}`);
   else if (event.type === 'goal.waiting_input') console.log(`목표 진행에 외부 입력이 필요합니다: ${event.question}`);
   else if (event.type === 'goal.assessed') console.log(`[goal:${event.round}] ${event.decision}: ${event.reason.slice(0, 300)}`);
+  else if (event.type === 'run.segment_advanced') console.log(`[segment:${event.segment}] ${event.reason} 체크포인트 이후 자동 계속`);
+  else if (event.type === 'goal.strategy_replanned') console.log(`[replan:${event.generation}] 무진전 접근을 제외하고 새 전략 탐색`);
+  else if (event.type === 'control.retry_scheduled') console.log(`[retry:${event.stage}] ${event.failures}회 실패; ${event.retry_at} 이후 자동 재시도`);
   else if (event.type === 'run.finished') console.log(`실행 종료: ${event.state} / 목표: ${event.goal_outcome} / 이유: ${event.termination_reason}\n보고서: ${event.report}`);
   else if (event.type === 'run.suspended') console.log(`목표 미달성 — 실행 구간 중단: ${event.termination_reason}\n진행 보고서: ${event.report}\n계속하려면 이 run을 resume하세요.`);
   else console.log(`[${event.type}] ${JSON.stringify(event).slice(0, 420)}`);
@@ -191,7 +196,7 @@ async function interactiveCommand(engine, line) {
     store.message(targeted[2], targeted[1]);
   } else if (cmd === 'add') addTask(store, argument);
   else if (cmd === 'retry') retryTask(store, argument.replace(/^T/iu, ''));
-  else if (cmd === 'pause' || cmd === 'resume') { store.setMeta('control', cmd === 'pause' ? 'paused' : 'running'); store.event('control.changed', { control: store.getMeta('control') }); }
+  else if (cmd === 'pause' || cmd === 'resume') { store.requestControl(cmd === 'pause' ? 'paused' : 'running'); store.event('control.changed', { control: store.getMeta('control') }); }
   else if (cmd === 'stop') engine.stop();
   else if (cmd === 'workers' || cmd === 'effort' || cmd === 'input-policy') {
     const config = store.getMeta('config');
@@ -325,7 +330,12 @@ async function main() {
     } else if (command === 'retry') console.log(`T${retryTask(store, values.target || positionals[1])} 재시도 대기. 종료된 run은 resume으로 이어가세요.`);
     else if (['pause', 'continue', 'stop'].includes(command)) {
       const control = { pause: 'paused', continue: 'running', stop: 'stopped' }[command];
-      store.setMeta('control', control); store.event('control.changed', { control });
+      if (command === 'stop') store.commitStopped('CLI stop requested');
+      else {
+        if (command === 'continue' && store.getMeta('state') === 'stopped') throw new Error('중단된 run은 continue가 아니라 resume으로 재개하세요.');
+        store.requestControl(control);
+      }
+      store.event('control.changed', { control });
       console.log(`제어 요청: ${control}`);
     } else if (command === 'export') {
       const file = path.join(directory, 'snapshot.json');

@@ -58,6 +58,7 @@ test('failed curation and rolled-back persistence remain eligible for retry', as
     return defaultResult(message);
   }) }); env.dispose(() => engine.close());
   const ids = seed(engine.store, env, 4);
+  engine.store.setMeta('control:lease', engine.controlEpoch);
   await engine.curate(true);
   assert.deepEqual(engine.store.curationProgress('docs.runtime'), {
     delivered_ids: ids, processed_ids: [], indexed_ids: [], unindexed_ids: ids,
@@ -186,6 +187,7 @@ test('Goal and Editor receive coverage and digests and may cite omitted verified
   await engine.ensureGoalContract();
   const outcome = await engine.assessGoal();
   assert.equal(outcome.kind, 'achieved');
+  engine.store.setMeta('control:lease', engine.controlEpoch);
   assert.equal(await engine.report(outcome), 'completed');
   assert.deepEqual([...seen], ['goal', 'editor']);
 });
@@ -233,6 +235,7 @@ test('completion validation rejects missing criteria and evidence made stale by 
   const valid = defaultResult({ role: 'goal', data: { contract, facts: view.compactFacts } });
   assert.throws(() => engine.validateGoalAssessment({ ...valid, requirement_evaluations: valid.requirement_evaluations.slice(1) }, contract, view), /모든 필수 조건/u);
   const candidate = engine.completionCandidate(view, contract);
+  engine.store.setMeta('control:lease', candidate.control_epoch);
   const unreviewed = { ...valid, round: 1, at: new Date().toISOString(), independent_review: {
     decision: 'reject', contract_revision: contract.revision, reason: 'Not independently established.',
     requirement_reviews: contract.requirements.map(item => ({ requirement_id: item.id, verdict: 'reject', reason: 'Insufficient.' })),
@@ -269,6 +272,7 @@ test('stored contracts are revalidated and corrupt requirement sets cannot be co
 
   const view = engine.goalContext();
   const candidate = engine.completionCandidate(view, empty);
+  engine.store.setMeta('control:lease', candidate.control_epoch);
   const emptyAssessment = { decision: 'achieved', contract_revision: empty.revision,
     requirement_evaluations: [], reason: 'Invalid.', progress: '', next_tasks: [], question: '',
     independent_review: { decision: 'accept', contract_revision: empty.revision, reason: 'Invalid.', requirement_reviews: [] } };

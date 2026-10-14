@@ -50,6 +50,7 @@ ${mode}`,
 - Return exactly one evaluation for every contract requirement and no others. Use satisfied only when current verified facts directly establish the whole requirement; cite at least one relevant fact. Use unsatisfied for evidence of a current failure and unknown when evidence is absent or incomplete.
 - Return achieved only when every requirement is satisfied and the requested outcome exists now. An unsuccessful search, exhausted scope, or a report describing missing results is not achievement unless that evaluation or report is itself the requested outcome.
 - If material work remains, return continue with the smallest useful set of 1 to ${maxTasks} executable, non-duplicate next_tasks. Each task needs a completion condition and depends_on may reference only earlier next-task indexes. Do not create a task merely to repeat accepted independent verification. After a failed or stalled approach, address the gap with a materially different approach.
+- Pending replan: do not rename or reopen excluded_task_ids. If excluded_task_coverage.truncated, inspect omitted task history in the ledger. Propose a materially different executable path.
 - requirement fact_ids may cite current verified facts supplied here or retrieved from the run ledger. Digest references are an index; read the underlying facts before citing them.
 - achieved requires empty next_tasks and question. continue requires nonempty next_tasks and an empty question.
 ${inputPolicy === 'continue'

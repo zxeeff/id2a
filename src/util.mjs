@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 
-export const VERSION = '0.4.0';
+export const VERSION = '0.5.0';
 export const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 export const now = () => new Date().toISOString();
 export const hash = value => crypto.createHash('sha256').update(value).digest('hex');

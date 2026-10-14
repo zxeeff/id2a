@@ -106,6 +106,15 @@ export class Store {
   setMeta(key, value) {
     this.db.prepare('INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, JSON.stringify(value));
   }
+  requestControl(control) {
+    if (!['running', 'paused'].includes(control)) throw new Error(`잘못된 제어 요청: ${control}`);
+    return this.transaction(() => {
+      const revision = (this.getMeta('control:revision', 0) || 0) + 1;
+      this.setMeta('control', control);
+      this.setMeta('control:revision', revision);
+      return revision;
+    });
+  }
   goalSource() {
     const goal = readText(path.join(this.directory, 'prompt.txt'));
     const instructions = this.db.prepare("SELECT id,text FROM messages WHERE target='all' ORDER BY id").all()
@@ -120,10 +129,10 @@ export class Store {
     const termination = this.getMeta('run:termination');
     const report = this.getMeta('report:status');
     // Version 3 wrote resumable non-achievement checkpoints as completed. Keep
-    // the ledger intact while presenting those records with the v4 state model.
+    // the ledger intact while presenting those records with the current state model.
     const executionState = state === 'completed' && explicitOutcome === 'not_established' ? 'suspended' : state;
     return {
-      format_version: 4,
+      format_version: 5,
       goal_format_version: this.getMeta('goal:format_version', 0),
       execution_state: executionState,
       goal_outcome: explicitOutcome || (state === 'completed' ? 'legacy_unknown' : 'pending'),
@@ -143,14 +152,38 @@ export class Store {
     return this.db.prepare('SELECT * FROM events WHERE id>? ORDER BY id LIMIT ?').all(after, limit)
       .map(row => ({ id: row.id, time: row.time, type: row.type, ...JSON.parse(row.data) }));
   }
+  reopenCompletedForWork(reason) {
+    if (this.getMeta('state') !== 'completed' || this.getMeta('goal:outcome') !== 'achieved') return false;
+    const control = this.getMeta('control');
+    const epoch = this.getMeta('control:epoch', 0) || 0;
+    const active = ['running', 'paused'].includes(control) && this.getMeta('control:lease') === epoch;
+    const changedAt = now();
+    if (!active) this.setMeta('control', 'stopped');
+    this.setMeta('state', active ? 'running' : 'stopped');
+    this.setMeta('goal:outcome', 'pending');
+    this.setMeta('run:termination', active ? null : { reason, at: changedAt });
+    this.setMeta('goal:candidate', null);
+    this.setMeta('goal:pending_terminal', null);
+    const report = this.getMeta('report:status', { state: 'not_started' });
+    if (report.state !== 'not_started') this.setMeta('report:status', { ...report, state: 'stale', reason });
+    const segment = this.getMeta('run:segment_state');
+    if (segment) this.setMeta('run:segment_state', { ...segment,
+      phase: active ? 'running' : 'stopped', ended_at: active ? null : changedAt,
+      termination_reason: active ? null : reason });
+    return true;
+  }
   addTask(task, { dependencies = [], kind = 'work', signature } = {}) {
     validate(task, schemas.worker.properties.followups.items);
     if (!task.title.trim() || !task.brief.trim() || !task.scope.trim()) throw new Error('빈 작업 제목/지시/범위는 허용하지 않습니다.');
     const fingerprint = signature || hash(normalize(`${task.title}\n${task.brief}\n${task.scope}`).toLowerCase());
-    const result = this.db.prepare('INSERT OR IGNORE INTO tasks(title,brief,scope,kind,signature,dependencies,created) VALUES (?,?,?,?,?,?,?)')
-      .run(task.title, task.brief, task.scope, kind, fingerprint, JSON.stringify(dependencies), now());
-    if (!result.changes) return null;
-    const id = Number(result.lastInsertRowid);
+    const id = this.transaction(() => {
+      const result = this.db.prepare('INSERT OR IGNORE INTO tasks(title,brief,scope,kind,signature,dependencies,created) VALUES (?,?,?,?,?,?,?)')
+        .run(task.title, task.brief, task.scope, kind, fingerprint, JSON.stringify(dependencies), now());
+      if (!result.changes) return null;
+      this.reopenCompletedForWork('task_added_after_completion');
+      return Number(result.lastInsertRowid);
+    });
+    if (id === null) return null;
     this.event('task.queued', { task: id, title: task.title, kind });
     return id;
   }
@@ -158,19 +191,49 @@ export class Store {
     const signature = hash(normalize(`${task.title}\n${task.brief}\n${task.scope}`).toLowerCase());
     return this.db.prepare('SELECT id FROM tasks WHERE signature=?').get(signature)?.id;
   }
+  taskWithSignature(signature) {
+    return this.db.prepare('SELECT id FROM tasks WHERE signature=?').get(signature)?.id;
+  }
+  followupGeneration(task, contract = this.getMeta('goal:contract'), source = this.goalSource()) {
+    return hash(JSON.stringify({
+      worker_generation: this.getMeta('worker:generation:' + task.id, 0) || 0,
+      followups: task.result?.followups || [],
+      goal_source: source.fingerprint,
+      contract: contract ? { revision: contract.revision, fingerprint: hash(JSON.stringify(contract)) } : null,
+    }));
+  }
+  followupsComplete(task, generation = this.followupGeneration(task)) {
+    return this.getMeta('followups:' + task.id) === true
+      && this.getMeta('followups:generation:' + task.id) === generation;
+  }
   task(id) {
     const row = this.db.prepare('SELECT * FROM tasks WHERE id=?').get(id);
     if (!row) throw new Error(`작업 T${id} 없음`);
     return { ...row, dependencies: JSON.parse(row.dependencies), result: row.result ? JSON.parse(row.result) : null };
   }
   tasks() { return this.db.prepare('SELECT id FROM tasks ORDER BY id').all().map(row => this.task(row.id)); }
-  updateTask(id, patch) {
+  updateTask(id, patch, { expectedState = null, expectedControlEpoch = null, allowStopped = false } = {}) {
     const allowed = new Set(['state', 'revisions', 'failures', 'result', 'feedback']);
     const entries = Object.entries(patch);
     if (!entries.length || entries.some(([key]) => !allowed.has(key))) throw new Error('잘못된 task patch');
-    this.db.prepare(`UPDATE tasks SET ${entries.map(([key]) => `${key}=?`).join(',')} WHERE id=?`)
-      .run(...entries.map(([key, value]) => key === 'result' && value !== null ? JSON.stringify(value) : value), id);
-    if (patch.state) this.event('task.state', { task: id, state: patch.state, reason: patch.feedback || '' });
+    const updated = this.transaction(() => {
+      if (expectedState && this.task(id).state !== expectedState) return false;
+      if (expectedControlEpoch !== null) {
+        const control = this.getMeta('control');
+        const epoch = this.getMeta('control:epoch', 0) || 0;
+        const sameLease = epoch === expectedControlEpoch
+          && this.getMeta('control:lease') === expectedControlEpoch
+          && ['running', 'paused'].includes(control);
+        if (!sameLease && !(allowStopped && control === 'stopped')) return false;
+      }
+      const result = this.db.prepare(`UPDATE tasks SET ${entries.map(([key]) => `${key}=?`).join(',')} WHERE id=?`)
+        .run(...entries.map(([key, value]) => key === 'result' && value !== null ? JSON.stringify(value) : value), id);
+      if (!result.changes) return false;
+      if (['queued', 'reviewing', 'running'].includes(patch.state)) this.reopenCompletedForWork('task_reopened_after_completion');
+      return true;
+    });
+    if (updated && patch.state) this.event('task.state', { task: id, state: patch.state, reason: patch.feedback || '' });
+    return updated;
   }
   readyTasks() {
     const tasks = this.tasks();
@@ -239,9 +302,14 @@ export class Store {
       fs.writeFileSync(destination, artifact.content, 'utf8');
     }
   }
-  submitWorker(taskID, result, taskDirectory, workspace) {
+  submitWorker(taskID, result, taskDirectory, workspace, { expectedState = null } = {}) {
     validate(result, schemas.worker);
     if (result.facts.length > 40 || result.followups.length > 8) throw new Error('한 작업의 사실/후속 작업 상한 초과');
+    // A revised worker submission has its own followup set. Clear the prior
+    // completion marker before persisting it so a crash can only cause a safe retry.
+    this.setMeta('followups:' + taskID, null);
+    this.setMeta('followups:generation:' + taskID, null);
+    this.setMeta('worker:generation:' + taskID, (this.getMeta('worker:generation:' + taskID, 0) || 0) + 1);
     this.writeDerivedArtifacts(result.artifacts, taskDirectory);
     const prepared = result.facts.map(fact => {
       const key = normalize(fact.key).toLowerCase();
@@ -251,20 +319,28 @@ export class Store {
       return { ...fact, key, claim: normalize(fact.claim), evidence: fact.evidence.map(reference => this.ingestEvidence(reference, taskDirectory, workspace)) };
     });
     const ids = this.transaction(() => {
+      if (expectedState && this.task(taskID).state !== expectedState) return null;
       const submission = Number(this.db.prepare('SELECT COALESCE(MAX(submission),0)+1 AS id FROM evidence WHERE task_id=?').get(taskID).id);
-      return prepared.map(fact => {
-      const claimHash = hash(fact.claim);
-      this.db.prepare('INSERT OR IGNORE INTO facts(key,scope,kind,claim,claim_hash,created) VALUES (?,?,?,?,?,?)')
-        .run(fact.key, fact.scope, fact.kind, fact.claim, claimHash, now());
-      const row = this.db.prepare('SELECT id FROM facts WHERE key=? AND claim_hash=? AND kind=?').get(fact.key, claimHash, fact.kind);
-      this.db.prepare('INSERT OR IGNORE INTO origins VALUES (?,?)').run(row.id, taskID);
-      for (const evidence of fact.evidence) this.db.prepare(
-        'INSERT OR IGNORE INTO evidence(fact_id,task_id,submission,sha256,source,note,bytes) VALUES (?,?,?,?,?,?,?)'
-      ).run(row.id, taskID, submission, evidence.sha256, evidence.source, evidence.note, evidence.bytes);
-      return row.id;
+      const committedIDs = prepared.map(fact => {
+        const claimHash = hash(fact.claim);
+        this.db.prepare('INSERT OR IGNORE INTO facts(key,scope,kind,claim,claim_hash,created) VALUES (?,?,?,?,?,?)')
+          .run(fact.key, fact.scope, fact.kind, fact.claim, claimHash, now());
+        const row = this.db.prepare('SELECT id FROM facts WHERE key=? AND claim_hash=? AND kind=?').get(fact.key, claimHash, fact.kind);
+        this.db.prepare('INSERT OR IGNORE INTO origins VALUES (?,?)').run(row.id, taskID);
+        for (const evidence of fact.evidence) this.db.prepare(
+          'INSERT OR IGNORE INTO evidence(fact_id,task_id,submission,sha256,source,note,bytes) VALUES (?,?,?,?,?,?,?)'
+        ).run(row.id, taskID, submission, evidence.sha256, evidence.source, evidence.note, evidence.bytes);
+        return row.id;
       });
+      this.db.prepare("UPDATE tasks SET result=?,state='reviewing' WHERE id=?")
+        .run(JSON.stringify({ ...result, fact_ids: [...new Set(committedIDs)] }), taskID);
+      return committedIDs;
     });
-    this.updateTask(taskID, { result: { ...result, fact_ids: [...new Set(ids)] }, state: 'reviewing' });
+    if (ids === null) {
+      this.event('task.submission_discarded', { task: taskID, reason: 'task_changed_during_worker' });
+      return null;
+    }
+    this.event('task.state', { task: taskID, state: 'reviewing', reason: '' });
     this.event('facts.proposed', { task: taskID, facts: [...new Set(ids)] });
     return [...new Set(ids)];
   }
@@ -329,6 +405,107 @@ export class Store {
     const sources = [...fileStates].map(([file, state]) => ({ file, ...state })).sort((left, right) => left.file.localeCompare(right.file));
     return { facts, snapshot: hash(JSON.stringify({ sources, artifacts })), sources, artifacts };
   }
+  commitStopped(detail = null, { fence = true } = {}) {
+    let committed = false;
+    this.transaction(() => {
+      const state = this.getMeta('state');
+      const outcome = this.getMeta('goal:outcome');
+      const control = this.getMeta('control');
+      // A stop command is also a fence. Even if the persisted state is already
+      // stopped, a controller may have captured that state and be about to claim
+      // it for resume. Advancing the epoch makes that pending claim fail.
+      if (control !== 'stopped' || fence) {
+        this.setMeta('control:epoch', (this.getMeta('control:epoch', 0) || 0) + 1);
+        this.setMeta('control', 'stopped');
+        committed = true;
+      }
+      if (this.getMeta('control:lease') !== null) {
+        this.setMeta('control:lease', null);
+        committed = true;
+      }
+      if (state === 'completed' && outcome === 'achieved') {
+        const report = this.getMeta('report:status', { state: 'not_started' });
+        if (report.state === 'generating') this.setMeta('report:status', { ...report, state: 'stale', reason: 'user_stopped' });
+        if (report.state === 'generating') committed = true;
+        return;
+      }
+      if (control === 'stopped' && state === 'stopped') {
+        if (fence) {
+          const previous = this.getMeta('run:termination');
+          const stoppedAt = previous?.reason === 'user_stopped' ? previous.at : now();
+          this.setMeta('run:termination', { reason: 'user_stopped', at: stoppedAt, ...(detail ? { detail } : {}) });
+          const segment = this.getMeta('run:segment_state');
+          if (segment) this.setMeta('run:segment_state', { ...segment, phase: 'stopped', ended_at: stoppedAt,
+            termination_reason: 'user_stopped' });
+          committed = true;
+        }
+        const report = this.getMeta('report:status', { state: 'not_started' });
+        if (report.state === 'generating') {
+          this.setMeta('report:status', { ...report, state: 'stale', reason: 'user_stopped' });
+          committed = true;
+        }
+        return;
+      }
+      const previous = this.getMeta('run:termination');
+      const stoppedAt = previous?.reason === 'user_stopped' ? previous.at : now();
+      this.setMeta('state', 'stopped');
+      this.setMeta('run:termination', { reason: 'user_stopped', at: stoppedAt, ...(detail ? { detail } : {}) });
+      const segment = this.getMeta('run:segment_state');
+      if (segment) this.setMeta('run:segment_state', { ...segment, phase: 'stopped', ended_at: stoppedAt,
+        termination_reason: 'user_stopped' });
+      const report = this.getMeta('report:status', { state: 'not_started' });
+      if (report.state === 'generating') this.setMeta('report:status', { ...report, state: 'stale', reason: 'user_stopped' });
+      committed = true;
+    });
+    return committed;
+  }
+  claimRunning(expectedEpoch, expectedControl = this.getMeta('control'),
+    expectedRevision = this.getMeta('control:revision', 0) || 0) {
+    let claimed = null;
+    this.transaction(() => {
+      const current = this.getMeta('control:epoch', 0) || 0;
+      if (current !== expectedEpoch || this.getMeta('control') !== expectedControl
+          || (this.getMeta('control:revision', 0) || 0) !== expectedRevision) return;
+      claimed = current + 1;
+      this.setMeta('control:epoch', claimed);
+      this.setMeta('control', 'running');
+      this.setMeta('control:lease', claimed);
+      if (this.getMeta('state') !== 'completed' || this.getMeta('goal:outcome') !== 'achieved') this.setMeta('state', 'running');
+    });
+    return claimed;
+  }
+  finishCompletedRun(candidate, reportID) {
+    return this.transaction(() => {
+      const view = this.ledgerData();
+      const source = this.goalSource();
+      const contract = this.getMeta('goal:contract');
+      const evidence = this.evidenceStatus(view);
+      const report = this.getMeta('report:status', { state: 'not_started' });
+      const messageCutoff = Number(this.db.prepare('SELECT COALESCE(MAX(id),0) AS id FROM messages').get().id);
+      if (this.getMeta('control') !== 'running'
+          || (this.getMeta('control:epoch', 0) || 0) !== candidate.control_epoch
+          || this.getMeta('control:lease') !== candidate.control_epoch
+          || this.getMeta('state') !== 'completed'
+          || this.getMeta('goal:outcome') !== 'achieved'
+          || JSON.stringify(this.getMeta('goal:candidate')) !== JSON.stringify(candidate)
+          || report.id !== reportID || !['complete', 'failed'].includes(report.state)
+          || candidate.goal_source_fingerprint !== source.fingerprint
+          || contract?.source?.fingerprint !== source.fingerprint
+          || candidate.contract_revision !== contract?.revision
+          || hash(JSON.stringify(contract)) !== candidate.contract_hash
+          || view.snapshot !== candidate.ledger_snapshot
+          || evidence.snapshot !== candidate.evidence_snapshot
+          || messageCutoff !== candidate.message_cutoff
+          || view.tasks.some(task => ['queued', 'reviewing', 'running'].includes(task.state))
+          || view.tasks.some(task => task.state === 'accepted' && task.kind === 'work'
+            && task.result?.followups?.length && !this.followupsComplete(task, this.followupGeneration(task, contract, source)))) {
+        return false;
+      }
+      this.setMeta('control', 'paused');
+      this.setMeta('control:lease', null);
+      return true;
+    });
+  }
   commitGoalOutcome(candidate, { outcome, termination, assessment, report }) {
     if (!['achieved', 'not_established'].includes(outcome)) throw new Error(`잘못된 목표 결과: ${outcome}`);
     if (outcome === 'achieved' && assessment?.decision !== 'achieved') throw new Error('달성 후보 없이 목표 달성을 기록할 수 없습니다.');
@@ -338,7 +515,12 @@ export class Store {
       const messageCutoff = Number(this.db.prepare('SELECT COALESCE(MAX(id),0) AS id FROM messages').get().id);
       const contract = this.getMeta('goal:contract');
       const evidence = this.evidenceStatus(view);
+      const source = this.goalSource();
       if (this.getMeta('control') !== 'running'
+          || (this.getMeta('control:epoch', 0) || 0) !== candidate.control_epoch
+          || this.getMeta('control:lease') !== candidate.control_epoch
+          || candidate.goal_source_fingerprint !== source.fingerprint
+          || contract?.source?.fingerprint !== source.fingerprint
           || view.snapshot !== candidate.ledger_snapshot
           || evidence.snapshot !== candidate.evidence_snapshot
           || messageCutoff !== candidate.message_cutoff
@@ -347,7 +529,6 @@ export class Store {
         throw new Error('현재 목표 계약과 일치하지 않는 최종 판정입니다.');
       }
       const expected = contract.requirements.map(item => item.id);
-      const source = this.goalSource();
       const sourceText = normalize(source.effective_text);
       if (contract.format_version !== 1 || expected.length < 2 || expected[0] !== 'G0'
           || new Set(expected).size !== expected.length
@@ -375,6 +556,11 @@ export class Store {
         throw new Error('최종 판정이 모든 필수 조건을 정확히 한 번 포함하지 않습니다.');
       }
       if (outcome === 'achieved') {
+        if (view.tasks.some(task => ['queued', 'reviewing', 'running'].includes(task.state))) return false;
+        if (view.tasks.some(task => task.state === 'accepted' && task.kind === 'work'
+            && task.result?.followups?.length && !this.followupsComplete(task, this.followupGeneration(task, contract, source)))) {
+          return false;
+        }
         const verified = new Set(view.facts.filter(fact => fact.state === 'verified').map(fact => fact.id));
         if (evaluations.some(item => item.verdict !== 'satisfied' || !item.fact_ids.length
             || new Set(item.fact_ids).size !== item.fact_ids.length
@@ -400,10 +586,51 @@ export class Store {
       this.setMeta('run:termination', termination);
       this.setMeta('report:status', report);
       this.setMeta('state', outcome === 'achieved' ? 'completed' : 'suspended');
-      if (outcome !== 'achieved') this.setMeta('control', 'paused');
+      const segment = this.getMeta('run:segment_state');
+      if (segment) this.setMeta('run:segment_state', { ...segment,
+        phase: outcome === 'achieved' ? 'completed' : 'suspended', ended_at: termination?.at || now(),
+        termination_reason: termination?.reason || (outcome === 'achieved' ? 'goal_achieved' : null) });
+      if (outcome !== 'achieved') {
+        this.setMeta('control', 'paused');
+        this.setMeta('control:lease', null);
+      }
       return true;
     });
     return committed;
+  }
+  reopenGoalOutcome(candidate, reportID, reason = 'context_changed') {
+    return this.transaction(() => {
+      const savedCandidate = this.getMeta('goal:candidate');
+      const report = this.getMeta('report:status', { state: 'not_started' });
+      if (this.getMeta('control') !== 'running'
+          || (this.getMeta('control:epoch', 0) || 0) !== candidate.control_epoch
+          || this.getMeta('control:lease') !== candidate.control_epoch
+          || this.getMeta('state') !== 'completed'
+          || this.getMeta('goal:outcome') !== 'achieved'
+          || JSON.stringify(savedCandidate) !== JSON.stringify(candidate)
+          || report.id !== reportID) return false;
+      this.setMeta('state', 'running');
+      this.setMeta('goal:outcome', 'pending');
+      this.setMeta('run:termination', null);
+      this.setMeta('goal:candidate', null);
+      this.setMeta('goal:pending_terminal', null);
+      this.setMeta('report:status', { ...report, state: 'stale', reason });
+      const segment = this.getMeta('run:segment_state');
+      if (segment) this.setMeta('run:segment_state', { ...segment, phase: 'running', ended_at: null, termination_reason: null });
+      return true;
+    });
+  }
+  updateCommittedReport(candidate, reportID, report) {
+    return this.transaction(() => {
+      if (this.getMeta('control') !== 'running'
+          || (this.getMeta('control:epoch', 0) || 0) !== candidate.control_epoch
+          || this.getMeta('control:lease') !== candidate.control_epoch
+          || this.getMeta('state') !== 'completed' || this.getMeta('goal:outcome') !== 'achieved'
+          || JSON.stringify(this.getMeta('goal:candidate')) !== JSON.stringify(candidate)
+          || this.getMeta('report:status')?.id !== reportID) return false;
+      this.setMeta('report:status', report);
+      return true;
+    });
   }
   validDigests(view, scope) {
     const verified = new Set(view.facts.filter(fact => fact.state === 'verified').map(fact => fact.id));
@@ -494,7 +721,7 @@ export class Store {
       for (const evidence of fact.evidence) if (hash(fs.readFileSync(evidence.artifact)) !== evidence.sha256) throw new Error(`F${fact.id}: 증거 해시 불일치`);
     }
   }
-  applyVerdict(taskID, verdict, expectedIDs) {
+  applyVerdict(taskID, verdict, expectedIDs, { expectedState = null, taskPatch = null } = {}) {
     validate(verdict, schemas.supervisor);
     const ids = verdict.fact_verdicts.map(item => item.id);
     if (new Set(ids).size !== ids.length || ids.length !== expectedIDs.length || ids.some(id => !expectedIDs.includes(id))) {
@@ -509,7 +736,12 @@ export class Store {
       } else if (verdict.fact_verdicts.some(item => item.state !== 'verified')) throw new Error('미검증/반박 사실이 있는 작업을 승인할 수 없습니다.');
     }
     this.checkEvidence(expectedIDs.map(id => this.fact(id)));
-    this.transaction(() => {
+    if (taskPatch) {
+      const allowed = new Set(['state', 'revisions', 'failures', 'result', 'feedback']);
+      if (!Object.keys(taskPatch).length || Object.keys(taskPatch).some(key => !allowed.has(key))) throw new Error('잘못된 task patch');
+    }
+    const committed = this.transaction(() => {
+      if (expectedState && this.task(taskID).state !== expectedState) return false;
       for (const item of verdict.fact_verdicts) {
         const previous = this.fact(item.id);
         // Repeated submissions cannot erase an independently confirmed result with "unresolved".
@@ -524,8 +756,20 @@ export class Store {
         if (positive.length > 1) this.db.prepare("UPDATE facts SET state='conflicted' WHERE key=? AND state IN ('verified','conflicted')").run(key);
         else if (positive.length === 1) this.db.prepare("UPDATE facts SET state='verified' WHERE id=?").run(positive[0].id);
       }
+      if (taskPatch) {
+        const entries = Object.entries(taskPatch);
+        this.db.prepare(`UPDATE tasks SET ${entries.map(([key]) => `${key}=?`).join(',')} WHERE id=?`)
+          .run(...entries.map(([key, value]) => key === 'result' && value !== null ? JSON.stringify(value) : value), taskID);
+      }
+      return true;
     });
+    if (!committed) {
+      this.event('facts.review_discarded', { task: taskID, reason: 'task_changed_during_review' });
+      return false;
+    }
     this.event('facts.reviewed', { task: taskID, decision: verdict.decision, verdicts: verdict.fact_verdicts });
+    if (taskPatch?.state) this.event('task.state', { task: taskID, state: taskPatch.state, reason: taskPatch.feedback || '' });
+    return true;
   }
   context(task, characters = 12000) {
     const view = this.ledgerView();
@@ -569,14 +813,23 @@ export class Store {
   message(text, target = 'all') {
     if (!text.trim()) throw new Error('추가 지시가 비어 있습니다.');
     if (Buffer.byteLength(text, 'utf8') > 2 * 1024 * 1024) throw new Error('추가 지시는 UTF-8 2MB 이하로 입력하세요.');
-    if (target !== 'all') {
-      const task = this.task(Number(target));
-      if (['accepted', 'stalled', 'rejected', 'blocked', 'cancelled'].includes(task.state)) {
-        this.updateTask(task.id, { state: 'queued', result: null, failures: 0, revisions: 0, feedback: '추가 사용자 지시에 따라 작업을 다시 확인합니다.' });
+    const taskTarget = target === 'all' ? null : Number(target);
+    if (taskTarget !== null && (!Number.isSafeInteger(taskTarget) || taskTarget < 1)) throw new Error('추가 지시의 task 대상이 잘못됐습니다.');
+    const normalizedTarget = taskTarget === null ? 'all' : String(taskTarget);
+    let reopenedTask = null;
+    const id = this.transaction(() => {
+      const task = taskTarget === null ? null : this.task(taskTarget);
+      if (task && task.state !== 'queued') {
+        this.db.prepare("UPDATE tasks SET state='queued',result=NULL,failures=0,revisions=0,feedback=? WHERE id=?")
+          .run('추가 사용자 지시에 따라 작업을 다시 확인합니다.', task.id);
+        reopenedTask = task.id;
       }
-    }
-    const id = Number(this.db.prepare('INSERT INTO messages(target,text,created) VALUES (?,?,?)').run(target, text, now()).lastInsertRowid);
-    this.event('user.instruction', { message: id, target, text });
+      const result = this.db.prepare('INSERT INTO messages(target,text,created) VALUES (?,?,?)').run(normalizedTarget, text, now());
+      this.reopenCompletedForWork('instruction_added_after_completion');
+      return Number(result.lastInsertRowid);
+    });
+    if (reopenedTask !== null) this.event('task.state', { task: reopenedTask, state: 'queued', reason: '추가 사용자 지시에 따라 작업을 다시 확인합니다.' });
+    this.event('user.instruction', { message: id, target: normalizedTarget, text });
     return id;
   }
   messages(taskID) {
