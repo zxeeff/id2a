@@ -166,7 +166,7 @@ C:\id2a\id2a.cmd doctor --provider codex --models
 
 1. Contract가 초기 프롬프트와 전체 추가 지시에서 목표 계약 후보를 만들고, 컨트롤러가 원문 전체를 나타내는 `G0` 조건을 추가합니다.
 2. Contract Review가 각 조건을 원문과 대조합니다. 모든 조건이 `covered`이고 누락이 없을 때만 계약 revision을 확정합니다.
-3. Planner가 승인된 목표 계약을 최대 8개 초기 작업으로 나눕니다. 선행 작업은 앞선 작업만 참조할 수 있습니다.
+3. Planner가 승인된 목표 계약을 최대 8개 초기 작업으로 나눕니다. 실행 중에도 같은 Planner를 짧은 refill 호출로 재사용해 필요한 독립 작업을 보충합니다. 새 제안 안에서는 앞선 작업만, 기존 원장에서는 실제 task ID를 선행 작업으로 참조합니다.
 4. Worker가 프로젝트를 구현·수정하고 관련 테스트를 실행한 뒤 최종 JSON으로 사실, 파생 파일, 후속 작업 제안을 제출합니다.
 5. 컨트롤러가 형식, 파일 경로, 존재 여부와 크기를 확인합니다. 증거 파일을 SHA-256 이름의 사본으로 보관합니다. 파일이 있다는 것만으로 주장을 검증 상태로 만들지는 않습니다.
 6. Supervisor가 새 세션에서 실제 증거 내용을 확인하고 모든 제출 사실을 정확히 한 번 판정합니다.
@@ -187,7 +187,7 @@ Goal·Editor에도 scope 색인과 선택된 digest를 제공합니다. `coverag
 
 Goal·Editor는 최초 프롬프트에 없었더라도 조회한 현재 검증 사실을 인용할 수 있습니다. 컨트롤러는 인용 ID가 현재 검증 집합에 속하는지 검사하고, 판단·편집 중 원장 내용이 바뀌면 결과를 확정하지 않고 다시 판정합니다. `facts_get`에 snapshot을 전달하면 같은 조회 기준을 확인할 수 있습니다. `workspace_read`는 프로젝트 안의 텍스트만 읽고, `evidence_read`는 원장에 등록된 fact ID와 SHA-256이 정확히 맞는 불변 증거만 읽습니다.
 
-기존 run은 스키마 변경 없이 읽을 수 있습니다. 다음 실행부터 과거 `curated_ids` 완료 표시는 신뢰하지 않고, 유효한 digest의 실제 인용과 새 성공 배치 기록을 기준으로 미처리 사실을 계산합니다.
+기존 run은 읽기 전용 조회로 계속 열 수 있습니다. 다음 쓰기 또는 재개 시 task의 `resources`, `logical_key` 열을 추가하며 기존 작업은 보수적으로 workspace write / CPU 1로 취급합니다. 과거 `curated_ids` 완료 표시는 신뢰하지 않고, 유효한 digest의 실제 인용과 새 성공 배치 기록을 기준으로 미처리 사실을 계산합니다.
 
 ## 저장 위치와 출력
 
@@ -215,6 +215,33 @@ result.json               달성이 확정된 실행 상태, 목표 결과, 계�
 기본 동시 작업 수는 2, 한 초기 계획 또는 목표 재계획 사이클의 작업 제안 상한은 8, 수정 요청은 작업당 최대 2회입니다. Agent turn은 실행 시간으로 종료하지 않습니다. Goal 판정은 실행 구간당 기본 12회, 같은 조건 판정과 이미 본 근거만 반복하는 무진전은 기본 3회, 제어 단계 복구 구간은 연속 실패 5회, provider 호출 체크포인트는 실행 구간당 기본 100회입니다. 누적 호출·판정·실패 이력은 원장에 계속 남고, 각 한도에 도달하면 컨트롤러가 새 구간을 자동으로 시작합니다.
 
 각 값은 `--workers`, `--max-tasks`, `--max-revisions`, `--max-goal-rounds`, `--max-no-progress`, `--max-control-failures`, `--max-attempts` 또는 대응하는 camelCase 설정 파일 필드로 변경할 수 있습니다. Agent turn에는 wall-clock timeout이 없으며 완료, 명시적 `stop`, provider 실패 중 하나가 발생할 때까지 실행됩니다. Worker도 일반적인 장기 빌드나 테스트에 임의의 timeout wrapper를 씌우지 않고 완료될 때까지 상태를 확인합니다. queued·reviewing 작업이 남아 있으면 체크포인트 뒤 다음 구간에서 먼저 이어서 처리하고, 작업 큐가 비었을 때만 Goal이 새 작업을 제안합니다. 무진전 시 기존 verdict·fact 이력은 보존하면서 전략 세대를 바꾸고 소진된 동일 작업의 자동 재개를 막습니다. 제어 단계 오류는 제한된 지수 backoff 후 계속 재시도합니다. `resume`은 한도 연장이 아니라 명시적 stop, 프로세스 종료 또는 장애 뒤의 복구 명령입니다. 작업별 기술적 실패는 최대 2회 후 `stalled`로 남고 Goal이 다른 접근을 찾습니다. `pause`는 새 배정 중지이며, 명시적인 중단은 사용자의 `stop`입니다. 한 run에는 컨트롤러 하나만 실행할 수 있습니다.
+
+## 실행 중 작업 보충과 자원 배정
+
+Worker는 실행하고 Supervisor는 작업별로 독립 검증합니다. Planner는 영구 대화 대신 원장의 현재 상태를 읽는 제한된 coordinator 호출로 재사용합니다. 다른 작업이 실행 중이어도 호환 가능한 준비 작업이 부족하면 새 작업을 제안합니다. 즉시 끝나는 작업에는 불필요한 refill을 요청하지 않습니다. 입력에는 목표 계약, task 상태·의존성·자원, 검증 사실과 digest, 이전 Goal 판정, worker/reviewer 용량과 현재 자원 점유가 포함됩니다. 생략된 원장은 coverage와 읽기 도구로 확인합니다. 이 Planner 호출은 변경 중인 workspace를 직접 조사하지 않습니다.
+
+| CLI | 설정 파일 필드 | 기본값과 의미 |
+|---|---|---|
+| `--frontier-target 10` | `frontierTarget` | 10. refill이 보충할 미완료 작업 수의 상한/준비 공급 목표. 의무 할당량이 아니며 0이면 refill을 끕니다. |
+| `--max-refills-per-cycle 4` | `maxRefillsPerCycle` | Goal 판정 사이에 최대 4번. 오래된 결과·실패 호출도 포함합니다. |
+| `--reviewers 1` | `reviewers` | 독립 검토 동시 실행 상한. Worker 슬롯과 별도입니다. |
+| `--cpu-capacity 2` | `cpuCapacity` | 새 설정에서는 workers 값이 기본. CPU/빌드 가중치 합계 상한이며 실제 CPU 사용량 측정값은 아닙니다. |
+
+한 refill 제안은 `maxTasks`와 남은 frontier 용량 중 작은 값까지만 허용됩니다. 사용자 추가 작업, 이미 승인된 후속 작업, Goal의 필수 보완 작업을 이 수치 때문에 버리지는 않습니다. `/workers` 변경은 저장된 CPU 용량을 바꾸지 않습니다. 둘을 함께 조정하려면 다음 `resume`의 CLI 옵션 또는 설정 파일을 사용하세요.
+
+refill은 run당 하나만 진행합니다. 요청 snapshot, 제어 revision, 호출 횟수, 판정, admission receipt는 SQLite에 남습니다. 계약·지시·설정·task graph·사실/digest·기록된 source 상태가 바뀌거나 호출 중 pause/resume을 거친 결과는 폐기하며, 검증과 삽입은 같은 transaction에서 처리합니다. `logical_key`와 정규화한 제목/지시/범위가 같은 제안은 기존 작업으로 연결합니다. 중복 제안의 다른 logical key도 영구 alias로 저장해 나중에 문구가 달라져도 같은 작업으로 연결합니다. 기존 task의 의존성을 바꾸지 않고 새 제안은 앞선 항목만 참조하므로 새로운 순환을 만들지 않습니다. 손상된 기존 의존성이나 실패한 선행 작업은 `blocked`로 표시해 Goal에 보여줍니다.
+
+Planner는 `READY`, `EXHAUSTED`, `DEFERRED`를 반환합니다. `EXHAUSTED`는 알려진 유용한 추가 작업이 없다는 뜻이며 목표 성공이 아닙니다. `DEFERRED`는 task ID가 종료 상태로 바뀜(`task_settled`), 사실/digest 변경(`knowledge_changed`), task graph/state 변경(`graph_changed`), 지시 변경(`instruction_changed`) 중 하나와 구체적 이유가 필요합니다. 판정은 캐시되며 시간 경과나 로그만으로 다시 호출하지 않습니다. 계약·지시·설정 변경은 캐시를 무효화합니다.
+
+`RUNNING → CLOSING → EVALUATING`은 별도의 durable frontier 상태입니다. EXHAUSTED, 유효한 새 작업이 없는 중복 제안, 호출 상한, refill 실패 또는 큐 소진 때 CLOSING으로 가서 refill을 멈추고 남은 실행·검토·필수 후속 작업을 처리합니다. 진행 중인 refill과 workspace 사용이 모두 끝난 후 Goal을 호출합니다. Goal이 필수 보완 작업을 지정하면 RUNNING을 다시 열고 호출 예산을 갱신합니다. 대기열이 비거나 의존성이 막혔다는 이유로 성공 처리하지 않으며, 기존 계약별 증거 검증·Goal Review·완료 CAS를 그대로 통과해야 합니다. 이 횟수 상한은 실행 종료나 wall-clock timeout이 아닙니다.
+
+작업은 `resources: {"workspace":"read" 또는 "write", "cpu":1}`을 선언할 수 있습니다. 생략하면 write/1이며 Supervisor는 read/1입니다. write는 같은 run의 모든 reader/writer와 충돌합니다. read끼리는 CPU 용량 안에서 병렬 실행할 수 있지만 빌드·캐시·테스트 결과 파일 쓰기도 금지됩니다. 검토를 우선 배정하고, 느린 검토 중에도 호환되는 독립 reader는 남은 Worker 슬롯에서 실행할 수 있습니다. 원장만 사용하는 refill Planner도 CPU 가중치 1을 예약하며 workspace는 점유하지 않습니다. CPU 여유가 없으면 호출 예산을 쓰지 않고 기다리므로 cpuCapacity=1에서는 Worker와 refill이 겹치지 않습니다. 실행 provider 수는 workers + reviewers + refill 1개 이내이며 예약 가중치 합계도 CPU 용량 이내로 제한됩니다.
+
+자원 예약은 만료 시간이 없고 제어 lease가 바뀌었다는 이유만으로 해제하지 않습니다. 내장 provider의 프로세스와 stdio close를 확인한 뒤 해제합니다. refill Planner도 같은 종료 확인과 복구 규칙을 따릅니다. 장애 후 재개에서는 기록된 provider PID가 살아 있거나 시작 여부가 불명확하면 작업 복구를 중단하고 예약을 보존합니다. 이 경우 해당 provider와 도구가 끝났는지 확인해야 합니다. PID를 알 수 없는 시작 중 장애는 원장의 예약을 확인하는 수동 복구가 필요합니다.
+
+이 MVP는 **run 내부의 협력적 자원 배정**입니다. 별도 worktree/불변 workspace snapshot, OS 수준 파일 잠금, 다른 run·외부 편집기·분리된 background 하위 프로세스의 관리는 제공하지 않습니다. read 선언과 역할의 읽기 전용 동작은 정확해야 하며, 작업 도구는 provider가 끝나기 전에 모두 종료해야 합니다. 내장 provider 프로세스가 끝나도 분리된 도구의 종료까지 증명하는 것은 아닙니다. 모든 writer가 같은 workspace를 쓰므로 쓰기 작업은 직렬화됩니다.
+
+`status --json`의 `frontier`, `refill`, `idle`, `reservations`와 `frontier.*`, `scheduler.idle` 이벤트로 동작을 확인합니다. idle 이유는 `frontier_empty`, `dependency_wait`, `review_wait`, `resource_blocked`, `refill_pending`, `exhausted_or_no_useful_work`, `frontier_closing`, `goal_evaluating`, `control_paused`, `attempt_budget`입니다. 호출 상한이나 오류에 의한 closure는 유용한 작업이 없다는 판정과 구분합니다. 상태가 바뀔 때만 이벤트를 남기며 시각 차이로 대기 시간을 계산할 수 있습니다. 소스 파일만 바꿔서는 실행 중인 컨트롤러가 이 동작을 사용하지 않습니다. 새 컨트롤러 또는 나중의 정상적인 stop/resume부터 적용됩니다.
 
 Worker의 파생 파일은 작업당 최대 16개, 파일당 UTF-8 512KB, 합계 2MB입니다. 증거는 파일당 64MB 이하이며 해당 작업 폴더 또는 자료 폴더 안에 있어야 합니다. 디렉터리 이탈, 드라이브 경로, Windows 특수 파일명, 출력 링크를 통한 바깥 폴더 덮어쓰기를 거부합니다.
 

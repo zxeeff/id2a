@@ -19,6 +19,9 @@ export async function demo(root, onEvent) {
       }] };
       if (role === 'contract_review') return { decision: 'accept', reason: '원래 요청을 그대로 보존합니다.', missing_requirements: [],
         requirement_reviews: data.proposal.requirements.map(item => ({ requirement_id: item.id, verdict: 'covered', reason: '요청에 직접 대응합니다.' })) };
+      if (role === 'planner' && data.context?.operation === 'rolling_refill') return {
+        status: 'EXHAUSTED', summary: 'Current task covers the goal.', tasks: [], wake: { kind: 'none', task_ids: [] },
+      };
       if (role === 'planner') return { summary: '문서의 실행 환경 확인', tasks: [{ title: 'Node.js 버전 확인', brief: 'sample-notes.txt에서 Node.js 최소 버전을 확인하세요.', scope: 'docs.runtime', depends_on: [] }] };
       if (role === 'worker') return { summary: '문서에 Node.js 24 이상이라고 명시되어 있습니다.', artifacts: [{ path: 'summary.txt', content: '문서에서 확인한 실행 환경: Node.js 24 이상\n' }], facts: [{ key: 'docs.runtime.node', scope: 'docs.runtime', kind: 'observation', claim: '문서는 Node.js 24 이상을 요구합니다.', evidence: [{ path: path.join(workspace, 'sample-notes.txt'), note: '두 번째 줄' }] }], followups: [] };
       if (role === 'supervisor') {

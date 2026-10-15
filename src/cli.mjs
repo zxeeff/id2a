@@ -13,6 +13,7 @@ const options = Object.fromEntries([
   'workspace', 'provider', 'review-provider', 'model', 'review-model', 'effort', 'review-effort',
   'workers', 'permissions', 'max-tasks', 'max-revisions', 'context-chars', 'curator-batch',
   'max-goal-rounds', 'max-no-progress', 'max-control-failures', 'max-attempts',
+  'frontier-target', 'max-refills-per-cycle', 'reviewers', 'cpu-capacity',
   'input-policy',
   'prompt', 'prompt-file', 'file', 'config', 'runs-root', 'codex-bin', 'claude-bin', 'target', 'query',
 ].map(name => [name, { type: 'string' }]));
@@ -56,6 +57,8 @@ start: 초기 프롬프트를 여러 줄로 붙여 넣고 마지막에 /end를 �
        --model MODEL  --review-model MODEL  --review-effort LEVEL
        --max-tasks 8  --max-revisions 2  --max-goal-rounds 12  --max-no-progress 3
        --max-control-failures 5  --max-attempts 100  --no-interactive  --json
+       --frontier-target 10 (0 disables rolling refill) --max-refills-per-cycle 4
+       --reviewers 1 --cpu-capacity N (defaults to workers; shared workspace readers/writers are reserved)
        Agent turns have no wall-clock timeout; they run until completion, explicit stop, or provider failure.
        --max-tasks는 전체 종료 한도가 아니라 한 목표 사이클이 제안할 수 있는 작업 상한입니다.
        호출·Goal·무진전 한도는 종료 조건이 아니라 체크포인트 주기입니다. 목표 달성 또는 명시적 stop까지 새 구간을 자동으로 이어갑니다.
@@ -80,6 +83,7 @@ function configPatch(base = {}) {
     permissions: 'permissions', 'max-tasks': 'maxTasks', 'max-revisions': 'maxRevisions',
     'max-goal-rounds': 'maxGoalRounds', 'max-no-progress': 'maxNoProgress', 'max-control-failures': 'maxControlFailures',
     'max-attempts': 'maxAttempts',
+    'frontier-target': 'frontierTarget', 'max-refills-per-cycle': 'maxRefillsPerCycle', reviewers: 'reviewers', 'cpu-capacity': 'cpuCapacity',
     'input-policy': 'inputPolicy',
     'context-chars': 'contextCharacters', 'curator-batch': 'curatorBatch', 'codex-bin': 'codexBin', 'claude-bin': 'claudeBin' };
   for (const [option, key] of Object.entries(map)) if (values[option] !== undefined) patch[key] = values[option];
@@ -103,6 +107,8 @@ function summary(store) {
     goal_outcome: completion.goal_outcome, termination: completion.termination, report: completion.report,
     segment: store.getMeta('run:segment_state'), checkpoint: store.getMeta('run:last_checkpoint'),
     replan: store.getMeta('goal:replan'),
+    frontier: store.getMeta('frontier:state'), refill: store.getMeta('frontier:request'),
+    idle: store.getMeta('scheduler:idle'), reservations: store.getMeta('scheduler:reservations', []),
     contract: store.getMeta('goal:contract'), goal: store.getMeta('goal:assessment'), counts,
     facts: store.listFacts({ limit: 500 }).map(({ id, key, state }) => ({ id, key, state })),
     tasks: tasks.map(({ id, title, state, revisions, failures, feedback }) => ({ id, title, state, revisions, failures, feedback })) };

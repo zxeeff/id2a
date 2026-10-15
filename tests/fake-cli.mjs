@@ -27,6 +27,7 @@ lines.on('line', line => {
         output({ method: 'item/agentMessage/delta', params: { itemId: 'answer', delta: result } });
         output({ method: 'item/completed', params: { item: { id: 'answer', type: 'agentMessage', phase: 'final_answer', text: result } } });
         output({ method: 'turn/completed', params: { turn: { id, status: 'completed' } } });
+        if (text.includes('[exit-before-close]')) process.exit(0);
       }, 300);
     } else if (message.method === 'turn/steer') { text += message.params.input[0].text; respond({ turnId: 'turn-' + turn }); }
   } else if (message.type === 'user') {

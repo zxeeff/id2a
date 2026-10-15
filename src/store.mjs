@@ -3,6 +3,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { boundedJSON, hash, integer, normalize, now, readText, within } from './util.mjs';
 import { goalAnchor, schemas, validate } from './schemas.mjs';
+import { graphProblems, validateTaskClaims } from './frontier.mjs';
 
 export class Store {
   constructor(directory, { readOnly = false, onEvent } = {}) {
@@ -60,6 +61,10 @@ export class Store {
         INSERT INTO fact_search(rowid, key, scope, claim) VALUES(new.id, new.key, new.scope, new.claim);
       END;
     `);
+    const taskColumns = this.db.prepare('PRAGMA table_info(tasks)').all().map(column => column.name);
+    if (!taskColumns.includes('resources')) this.db.exec("ALTER TABLE tasks ADD COLUMN resources TEXT NOT NULL DEFAULT '{\"workspace\":\"write\",\"cpu\":1}'");
+    if (!taskColumns.includes('logical_key')) this.db.exec('ALTER TABLE tasks ADD COLUMN logical_key TEXT');
+    this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS tasks_logical_key ON tasks(logical_key) WHERE logical_key IS NOT NULL');
     const evidenceColumns = this.db.prepare('PRAGMA table_info(evidence)').all();
     const hasSubmission = evidenceColumns.some(column => column.name === 'submission');
     const expectedUnique = ['fact_id', 'task_id', 'submission', 'source', 'sha256', 'note'];
@@ -174,12 +179,15 @@ export class Store {
   }
   addTask(task, { dependencies = [], kind = 'work', signature } = {}) {
     validate(task, schemas.worker.properties.followups.items);
-    if (!task.title.trim() || !task.brief.trim() || !task.scope.trim()) throw new Error('빈 작업 제목/지시/범위는 허용하지 않습니다.');
     const fingerprint = signature || hash(normalize(`${task.title}\n${task.brief}\n${task.scope}`).toLowerCase());
+    const resources = validateTaskClaims(task);
     const id = this.transaction(() => {
-      const result = this.db.prepare('INSERT OR IGNORE INTO tasks(title,brief,scope,kind,signature,dependencies,created) VALUES (?,?,?,?,?,?,?)')
-        .run(task.title, task.brief, task.scope, kind, fingerprint, JSON.stringify(dependencies), now());
+      if (task.logical_key && this.getMeta('task:key:' + task.logical_key)) return null;
+      if (dependencies.some(id => !Number.isSafeInteger(id) || !this.db.prepare('SELECT id FROM tasks WHERE id=?').get(id))) throw new Error('Unknown task dependency.');
+      const result = this.db.prepare('INSERT OR IGNORE INTO tasks(title,brief,scope,kind,signature,dependencies,resources,logical_key,created) VALUES (?,?,?,?,?,?,?,?,?)')
+        .run(task.title, task.brief, task.scope, kind, fingerprint, JSON.stringify([...new Set(dependencies)]), JSON.stringify(resources), task.logical_key || null, now());
       if (!result.changes) return null;
+      if (task.logical_key) this.aliasTask(task.logical_key, Number(result.lastInsertRowid));
       this.reopenCompletedForWork('task_added_after_completion');
       return Number(result.lastInsertRowid);
     });
@@ -188,8 +196,20 @@ export class Store {
     return id;
   }
   existingTask(task) {
+    if (task.logical_key) {
+      const alias = this.getMeta('task:key:' + task.logical_key);
+      if (alias) return alias;
+      const same = this.db.prepare('SELECT id FROM tasks WHERE logical_key=?').get(task.logical_key);
+      if (same) return same.id;
+    }
     const signature = hash(normalize(`${task.title}\n${task.brief}\n${task.scope}`).toLowerCase());
     return this.db.prepare('SELECT id FROM tasks WHERE signature=?').get(signature)?.id;
+  }
+  aliasTask(key, id) {
+    if (!Number.isSafeInteger(id) || !this.db.prepare('SELECT id FROM tasks WHERE id=?').get(id)) throw new Error('Unknown task for logical key.');
+    const previous = this.getMeta('task:key:' + key);
+    if (previous && previous !== id) throw new Error('Task logical key already identifies different work.');
+    this.setMeta('task:key:' + key, id);
   }
   taskWithSignature(signature) {
     return this.db.prepare('SELECT id FROM tasks WHERE signature=?').get(signature)?.id;
@@ -209,7 +229,11 @@ export class Store {
   task(id) {
     const row = this.db.prepare('SELECT * FROM tasks WHERE id=?').get(id);
     if (!row) throw new Error(`작업 T${id} 없음`);
-    return { ...row, dependencies: JSON.parse(row.dependencies), result: row.result ? JSON.parse(row.result) : null };
+    // A newly spawned read-only MCP may serve an old running controller. Do
+    // not add fields to its legacy ledger fingerprint before schema migration.
+    return { ...row, ...(Object.hasOwn(row, 'resources') ? {
+      resources: JSON.parse(row.resources), logical_key: row.logical_key || null,
+    } : {}), dependencies: JSON.parse(row.dependencies), result: row.result ? JSON.parse(row.result) : null };
   }
   tasks() { return this.db.prepare('SELECT id FROM tasks ORDER BY id').all().map(row => this.task(row.id)); }
   updateTask(id, patch, { expectedState = null, expectedControlEpoch = null, allowStopped = false } = {}) {
@@ -238,11 +262,15 @@ export class Store {
   readyTasks() {
     const tasks = this.tasks();
     const byID = new Map(tasks.map(task => [task.id, task]));
+    const invalid = graphProblems(tasks);
     const ready = [];
     for (const task of tasks.filter(task => task.state === 'queued' || task.state === 'reviewing')) {
-      if (task.dependencies.some(id => !byID.has(id))) throw new Error(`T${task.id}: 알 수 없는 선행 작업`);
-      if (task.dependencies.some(id => ['rejected', 'stalled', 'blocked', 'cancelled'].includes(byID.get(id).state))) {
+      if (invalid.has(task.id)) {
+        this.updateTask(task.id, { state: 'blocked', feedback: 'Missing dependency or dependency cycle; Goal must resolve this work.' });
+        task.state = 'blocked';
+      } else if (task.dependencies.some(id => ['rejected', 'stalled', 'blocked', 'cancelled'].includes(byID.get(id).state))) {
         this.updateTask(task.id, { state: 'blocked', feedback: '선행 작업이 승인되지 않았습니다.' });
+        task.state = 'blocked';
       } else if (task.dependencies.every(id => byID.get(id).state === 'accepted')) ready.push(task);
     }
     return ready;
@@ -305,6 +333,7 @@ export class Store {
   submitWorker(taskID, result, taskDirectory, workspace, { expectedState = null } = {}) {
     validate(result, schemas.worker);
     if (result.facts.length > 40 || result.followups.length > 8) throw new Error('한 작업의 사실/후속 작업 상한 초과');
+    for (const followup of result.followups) validateTaskClaims(followup);
     // A revised worker submission has its own followup set. Clear the prior
     // completion marker before persisting it so a crash can only cause a safe retry.
     this.setMeta('followups:' + taskID, null);
@@ -653,6 +682,7 @@ export class Store {
   taskRecord(task) {
     const { id, title, brief, scope, kind, state, dependencies, revisions, failures, feedback, result } = task;
     return { id, title, brief, scope, kind, state, dependencies, revisions, failures, feedback,
+      resources: task.resources, logical_key: task.logical_key,
       result: result ? { summary: result.summary, fact_ids: result.fact_ids,
         artifacts: (result.artifacts || []).map(artifact => {
           const file = path.join(this.directory, 'tasks', 'T' + id, 'outputs', artifact.path);

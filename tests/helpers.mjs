@@ -48,6 +48,9 @@ export function defaultResult({ role, data }) {
     decision: 'accept', reason: 'The contract preserves the request.', missing_requirements: [],
     requirement_reviews: data.proposal.requirements.map(item => ({ requirement_id: item.id, verdict: 'covered', reason: 'Covered by the contract.' })),
   };
+  if (role === 'planner' && data.context?.operation === 'rolling_refill') return {
+    status: 'EXHAUSTED', summary: 'Existing work covers the request; await independent verification.', tasks: [], wake: { kind: 'none', task_ids: [] },
+  };
   if (role === 'planner') return { summary: 'Check notes', tasks: [{ ...task(), depends_on: [] }] };
   if (role === 'worker') throw new Error('Worker fixture needs an explicit workspace.');
   if (role === 'supervisor') {

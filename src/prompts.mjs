@@ -20,18 +20,28 @@ export function makePrompt(role, { goal, contract, task, workspace, directory, c
 - List every omitted mandatory outcome, deliverable, or constraint in missing_requirements with a short exact source quote.
 - Accept only when no requirement is weakened or unsupported and no mandatory requirement is missing.`,
 
-    planner: `Create the smallest executable plan that can achieve the user's goal: one task for a simple goal and at most ${maxTasks} tasks.
+    planner: context?.operation === 'rolling_refill' ? `Act as a bounded rolling coordinator for the fixed goal contract. Workers execute; independent Supervisors verify.
+- Use only assigned data and the run ledger. Do not inspect or run commands in the mutable workspace; workers may be changing it now.
+- Propose 0..${maxTasks} useful tasks; the frontier target is a ceiling, never a quota. Preserve accepted facts and avoid repeating existing or exhausted work. Inspect omitted ledger tasks when coverage is truncated.
+- READY requires nonempty tasks. EXHAUSTED means no useful uncovered work remains in this snapshot; it is not a declaration of goal success. DEFERRED means useful planning needs a concrete change; supply a reason and wake condition.
+- For DEFERRED, wake.kind is task_settled (name unfinished task IDs), knowledge_changed (new facts/digests), graph_changed (task graph/state change), or instruction_changed. Other statuses use wake.kind=none and task_ids=[].
+- Every proposal needs a persistent logical_key for its intended outcome (reuse existing keys), a self-contained completion condition, scope, resources, depends_on (earlier proposal indexes only), and existing_dependencies (ledger task IDs). Never remove real prerequisites to fill capacity.
+- resources.workspace=read only when the task can finish without any workspace mutation, including build/test outputs; otherwise use write. cpu is a positive integer weight for concurrent CPU/build use. Shared readers conflict with a writer. Use occupancy and capacity to find compatible independent work.
+- Return no filler, speculative optional work, duplicate variants, or plans/questions as tasks. Stop proposing when completion is plausible; Goal will judge a stable snapshot.
+${mode}` : `Create the smallest executable plan that can achieve the user's goal: one task for a simple goal and at most ${maxTasks} tasks.
 - Treat the supplied goal contract as fixed. Tasks may implement or verify it but cannot weaken or replace its requirements.
 - Plan from the assigned data and leave workspace inspection to workers.
 - Give every task a clear title, a self-contained brief with its completion condition, and a stable dot-separated scope such as docs.installation.
+- logical_key identifies the intended work. Set resources={workspace:read|write,cpu:positive integer} within supplied capacity. Read forbids even build/test output writes.
 - In depends_on, use only zero-based indexes of earlier tasks. Add dependencies for real prerequisites or overlapping edits; leave independent work parallel.
 - A worker can inspect, implement, and validate in one task. Split work only where that improves execution or independent verification.
 - Describe derived text deliverables as artifacts; do not ask workers to write them directly into the task directory.
 - Do not create a task whose only deliverable is a question, approval, or another plan. Turn ambiguity into a reasonable working assumption and substantive work.
 ${mode}`,
 
-    worker: `Complete the assigned task end to end. Inspect the relevant project context, make requested source-workspace changes, and run validation proportionate to the task. Deliver the result, not instructions for someone else to implement.
-- Keep changes focused, preserve unrelated work, follow repository conventions, and resolve any revision_feedback.
+    worker: `Complete the task end to end: inspect the project, implement changes, and validate the result.
+- Preserve unrelated work, follow repository conventions, and resolve revision_feedback.
+- task.resources.workspace=read forbids all workspace writes, including build/test outputs. Respect cpu weight; finish all tools before returning, with no detached work.
 - Let long builds/tests finish; use timeouts only to test them or stop a confirmed hang.
 - When the task names a source file, read it directly with workspace_read; do not search for it or use shell merely to print it. Use shell only when discovery or validation requires it.
 - facts: include only durable, useful outcomes supported by actual files. Use the assigned task scope or a dot-separated child scope, a stable hierarchical key, a narrow claim, kind=observation for a confirmed state or kind=dead_end for an evidenced failed path, and at least one precise evidence note. Use absolute paths for source-workspace evidence and outputs/<path> for artifact evidence. Reuse an existing key and exact claim when the proposition is unchanged. Use [] when there is no worthwhile fact.
@@ -88,6 +98,7 @@ Apply the goal, assigned task, and user_instructions below; later user instructi
 Return exactly one complete JSON object matching the supplied schema.
 
 ${roleText}
+${role === 'worker' && task?.resources?.workspace === 'read' ? '\nThis task holds a shared READ reservation. Do not modify the workspace or run tools that write build/cache/test outputs. If mutation is required, submit the gap for replanning with a WRITE reservation.\n' : ''}
 ${context?.lookup ? '\nContext is a selection: coverage reports total/included/truncated for each collection. Digests are indexes, not complete evidence. Use ledger_page with context.snapshot to enumerate omitted records and facts_get for evidence. current_evidence=false means the registered source has changed or disappeared and cannot support current completion. Prioritize unresolved work before a completion decision; absence from this prompt is not proof of absence from the ledger. On a snapshot-change error, refresh from offset 0.\n' : ''}
 
 Assigned data (JSON):

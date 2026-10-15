@@ -3,9 +3,11 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { Store } from './store.mjs';
-import { goalAnchor, schemas, validate } from './schemas.mjs';
+import { goalAnchor, outputSchema, schemas, validate } from './schemas.mjs';
 import { makePrompt } from './prompts.mjs';
 import { providerFor } from './providers.mjs';
+import { admitRefill, decisionAwake, frontierSnapshot, resourcesFor, validateTaskClaims } from './frontier.mjs';
+import { Resources } from './resources.mjs';
 import { acquireLock, boundedJSON, hash, integer, now, readJSON, readText, sleep, sourceIdentity, writeJSON } from './util.mjs';
 
 export const defaultRunsRoot = fileURLToPath(new URL('../runs/', import.meta.url));
@@ -55,11 +57,15 @@ export function configuration(input = {}) {
     model: provider === 'codex' ? 'gpt-5.6-sol' : null, maxTasks: 8, maxRevisions: 2,
     maxFailures: 2, maxControlFailures: 5, maxGoalRounds: 12, maxNoProgress: 3, maxAttempts: 100,
     contextCharacters: 12000, curatorBatch: 4,
+    frontierTarget: 10, maxRefillsPerCycle: 4, reviewers: 1, cpuCapacity: input.workers || 2,
     roleSettings: {}, ...input,
   };
   // Older run manifests may contain the former per-agent wall-clock timeout.
   // Agent turns now run until completion, an explicit stop, or provider failure.
   delete config.timeout;
+  for (const [label, min, max] of [['frontierTarget', 0, 128], ['maxRefillsPerCycle', 1, 32], ['reviewers', 1, 32], ['cpuCapacity', 1, 1024]]) {
+    config[label] = integer(config[label], label, min, max);
+  }
   config.workspace = fs.realpathSync(config.workspace);
   if (!fs.statSync(config.workspace).isDirectory()) throw new Error('workspace는 폴더여야 합니다.');
   if (!['codex', 'claude'].includes(config.provider)) throw new Error('provider는 codex 또는 claude입니다.');
@@ -140,6 +146,9 @@ export class Engine {
     this.onDelta = onDelta;
     this.sessions = new Map();
     this.activeTasks = new Map();
+    this.activeStages = new Map();
+    this.resources = new Resources(this.store);
+    this.refillPromise = null;
     this.abortController = new AbortController();
     this.polling = false;
     this.controlEpoch = this.store.getMeta('control:epoch', 0) || 0;
@@ -203,9 +212,10 @@ export class Engine {
       || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch
       || this.store.getMeta('control:lease') !== this.controlEpoch;
   }
-  async runAgent(role, task, data = {}) {
+  async runAgent(role, task, data = {}, { reservationID = task?.id || null } = {}) {
     const settings = this.settings(role);
     const taskID = task?.id || null;
+    const schema = role === 'planner' && data.context?.operation === 'rolling_refill' ? schemas.refill : schemas[role];
     // Goal finalization and reporting remain available after the ordinary segment
     // budget is spent so a long run cannot end without an explicit assessment.
     const finalizationRole = ['contract', 'contract_review', 'goal', 'goal_review', 'editor'].includes(role);
@@ -229,8 +239,9 @@ export class Engine {
       goal: this.goal, task: promptTask, workspace: this.config.workspace, directory: taskDirectory,
       contract, instructions, maxTasks: this.config.maxTasks, inputPolicy: this.config.inputPolicy, ...data,
     });
+    const requestedSchema = outputSchema(schema);
     fs.writeFileSync(path.join(attemptDirectory, 'prompt.txt'), prompt, 'utf8');
-    writeJSON(path.join(attemptDirectory, 'schema.json'), schemas[role]);
+    writeJSON(path.join(attemptDirectory, 'schema.json'), requestedSchema);
     const onEvent = event => {
       fs.appendFileSync(path.join(attemptDirectory, 'stream.jsonl'), JSON.stringify(event) + '\n');
       if (event.type === 'provider.delta') { this.onDelta?.({ type: 'agent.delta', task: taskID, role, attempt, text: event.text }); return; }
@@ -243,15 +254,25 @@ export class Engine {
       bin: this.config[settings.provider + 'Bin'],
       onEvent, onRaw: event => fs.appendFileSync(path.join(attemptDirectory, 'raw.jsonl'), JSON.stringify(event) + '\n'),
       onSession: (sessionID, turnID) => this.store.session(attempt, sessionID, turnID),
+      onProcess: (state, pid) => this.resources.process(reservationID, state, pid),
     });
     for (const instruction of instructions) this.store.delivered(instruction.id, attempt, 'included');
     this.sessions.set(attempt, { session, taskID });
     this.store.event('agent.started', { attempt, task: taskID, role, provider: settings.provider, model: settings.model, effort: settings.effort, directory: workingDirectory });
-      const result = validate(await session.run({
-        prompt, schema: schemas[role], signal: this.abortController.signal,
+    this.resources.process(reservationID, 'starting');
+    let raw;
+    try {
+      raw = await session.run({
+        prompt, schema: requestedSchema, signal: this.abortController.signal,
         sessionID: role === 'worker' ? this.store.interruptedSession(taskID, settings.provider) : undefined,
-        readOnly: role !== 'worker', model: settings.model, effort: settings.effort, permissions: this.config.permissions,
-      }), schemas[role]);
+        readOnly: role !== 'worker' || task?.resources?.workspace === 'read', model: settings.model, effort: settings.effort, permissions: this.config.permissions,
+      });
+    } finally {
+      // Injected providers obey the same settled-run lifecycle contract, but do
+      // not own a CLI process. Built-in providers explicitly confirm close.
+      if (!session.managedProcess) this.resources.process(reservationID, 'stopped');
+    }
+      const result = validate(raw, schema);
       writeJSON(path.join(attemptDirectory, 'result.json'), result);
       this.store.endAttempt(attempt, 'completed');
       this.store.event('agent.completed', { attempt, task: taskID, role });
@@ -397,6 +418,7 @@ export class Engine {
       if (plan.tasks.length > this.config.maxTasks) throw new Error('계획의 초기 작업 상한 초과');
       const seen = new Set();
       for (const [index, task] of plan.tasks.entries()) {
+        validateTaskClaims(task, this.config.cpuCapacity);
         if (task.depends_on.some(dependency => dependency < 0 || dependency >= index)) throw new Error('계획은 앞선 작업만 선행 작업으로 참조할 수 있습니다.');
         const identity = hash(`${task.title}\n${task.brief}\n${task.scope}`.normalize('NFKC').replace(/\s+/gu, ' ').trim().toLowerCase());
         if (seen.has(identity)) throw new Error('계획에 중복 작업이 있습니다.');
@@ -415,7 +437,9 @@ export class Engine {
       }
     }
     if (!plan) {
-      plan = checkPlan((await this.runAgent('planner')).result);
+      plan = checkPlan((await this.runAgent('planner', null, { context: {
+        capacity: { workers: this.config.workers, reviewers: this.config.reviewers, cpu: this.config.cpuCapacity },
+      } })).result);
       generated = true;
     }
     if (generated) {
@@ -429,8 +453,11 @@ export class Engine {
     }
     const ids = [];
     for (const [index, task] of plan.tasks.entries()) {
-      const brief = { title: task.title, brief: task.brief, scope: task.scope };
-      ids.push(this.store.existingTask(brief) || this.store.addTask(brief, { dependencies: task.depends_on.map(dependency => ids[dependency]) }));
+      const brief = { title: task.title, brief: task.brief, scope: task.scope,
+        ...(task.resources ? { resources: task.resources } : {}), ...(task.logical_key ? { logical_key: task.logical_key } : {}) };
+      const id = this.store.existingTask(brief) || this.store.addTask(brief, { dependencies: task.depends_on.map(dependency => ids[dependency]) });
+      if (brief.logical_key) this.store.aliasTask(brief.logical_key, id);
+      ids.push(id);
     }
     this.store.setMeta('planned', true);
     this.store.event('plan.created', { summary: plan.summary, tasks: ids });
@@ -454,7 +481,9 @@ export class Engine {
         this.store.updateTask(id, { state: 'running' });
         const { result, directory } = await this.runAgent('worker', task, { context: this.store.context(task, this.config.contextCharacters), feedback: task.feedback });
         if (this.store.submitWorker(id, result, directory, this.config.workspace, { expectedState: 'running' }) === null) return;
-        task = this.store.task(id);
+        // Review is dispatched separately. A slow reviewer consumes a bounded
+        // review slot, leaving execution slots available for compatible work.
+        return;
       }
       const facts = this.store.factsForTask(id).filter(fact => task.result.fact_ids.includes(fact.id));
       this.store.checkEvidence(facts);
@@ -505,6 +534,137 @@ export class Engine {
       } else if (error.code === 'ID2A_ATTEMPT_BUDGET') {
         this.store.event('task.deferred', { task: id, reason: 'attempt_budget', detail: error.message });
       }
+    }
+  }
+  frontierState() {
+    return this.store.getMeta('frontier:state', { phase: 'RUNNING', rounds: 0, cycle: 1 });
+  }
+  frontierPhase(phase, reason, reset = false) {
+    const before = this.frontierState();
+    const state = { ...before, phase, reason, at: now(),
+      ...(reset ? { rounds: 0, cycle: before.cycle + 1 } : {}) };
+    this.store.setMeta('frontier:state', state);
+    if (reset) this.store.setMeta('frontier:decision', null);
+    if (phase !== before.phase || reset) this.store.event('frontier.phase', state);
+  }
+  stageCounts() {
+    const stages = [...this.activeStages.values()];
+    return { workers: stages.filter(stage => stage === 'worker').length,
+      reviewers: stages.filter(stage => stage === 'review').length };
+  }
+  async refill(request) {
+    try {
+      const view = this.goalContext();
+      const { result } = await this.runAgent('planner', null, {
+        maxTasks: request.limit, facts: view.compactFacts,
+        context: { ...view.knowledge, operation: 'rolling_refill', coverage: view.coverage,
+          snapshot: view.snapshot, planning_snapshot: request.snapshot,
+          tasks: view.compactTasks, task_counts: view.counts,
+          frontier: { ...this.frontierState(), target: this.config.frontierTarget, proposal_limit: request.limit },
+          capacity: { workers: this.config.workers, reviewers: this.config.reviewers, cpu: this.config.cpuCapacity,
+            active: this.stageCounts(), occupied: this.resources.occupied() },
+          previous_assessment: this.store.getMeta('goal:assessment'),
+          replan: this.store.getMeta('goal:replan'),
+        },
+      }, { reservationID: request.reservation });
+      const receipt = admitRefill(this.store, request, result, { epoch: this.controlEpoch, cpuCapacity: this.config.cpuCapacity });
+      this.store.event(receipt.stale ? 'frontier.stale' : 'frontier.refilled', { request: request.id, ...receipt, summary: result.summary });
+      if (!receipt.stale && (result.status === 'EXHAUSTED' || (result.status === 'READY' && !receipt.admitted.length))) {
+        this.frontierPhase('CLOSING', result.status === 'EXHAUSTED' ? 'exhausted' : 'no_useful_work');
+      }
+    } catch (error) {
+      this.store.event('frontier.failed', { request: request.id, reason: error.message });
+      // A failed coordinator cannot consume the controller indefinitely. Drain
+      // and let Goal diagnose/replan using the independent completion contract.
+      this.frontierPhase('CLOSING', 'refill_failed');
+    } finally {
+      if (this.store.getMeta('frontier:request')?.id === request.id) this.store.setMeta('frontier:request', null);
+    }
+  }
+  maybeRefill(ready) {
+    if (!this.config.frontierTarget || this.refillPromise || this.store.getMeta('frontier:request') || this.frontierState().phase !== 'RUNNING'
+        || this.store.getMeta('control') !== 'running' || this.controlLeaseLost()) return;
+    if (!this.activeTasks.size) {
+      if (!ready.length) this.frontierPhase('CLOSING', 'frontier_empty');
+      return;
+    }
+    if (this.frontierState().rounds >= this.config.maxRefillsPerCycle || this.attemptBudgetExhausted()) {
+      this.frontierPhase('CLOSING', 'refill_budget'); return;
+    }
+    // Never plan from an obsolete contract while new user instructions await
+    // reconciliation. Existing required work drains before Goal refreshes it.
+    if (this.store.getMeta('goal:contract')?.source.fingerprint !== this.goalSource().fingerprint) {
+      this.frontierPhase('CLOSING', 'instructions_changed'); return;
+    }
+    const supply = ready.filter(task => !this.activeTasks.has(task.id) && !task.result && task.kind === 'work'
+      && this.resources.canRun(task, false, this.config.cpuCapacity)).length;
+    const room = this.config.frontierTarget - this.pendingTasks().length;
+    if (supply >= this.config.frontierTarget || room <= 0) return;
+    const snapshot = frontierSnapshot(this.store);
+    if (!decisionAwake(this.store.getMeta('frontier:decision'), snapshot, this.store.tasks())) return;
+    const id = crypto.randomUUID();
+    const request = { id, reservation: 'refill:' + id, snapshot, controlRevision: this.store.getMeta('control:revision', 0) || 0,
+      limit: Math.min(this.config.maxTasks, room), at: now() };
+    if (!this.resources.reserveCoordinator(request.reservation, this.config.cpuCapacity)) return;
+    try {
+      this.store.transaction(() => {
+        this.store.setMeta('frontier:request', request);
+        this.store.setMeta('frontier:state', { ...this.frontierState(), rounds: this.frontierState().rounds + 1 });
+      });
+    } catch (error) { this.resources.release(request.reservation); throw error; }
+    this.store.event('frontier.requested', { request: request.id, limit: request.limit, snapshot: snapshot.key });
+    this.refillPromise = this.refill(request).finally(() => {
+      this.resources.release(request.reservation);
+      this.refillPromise = null;
+    });
+  }
+  dispatch(ready) {
+    // Pending reviews get first access to the shared workspace so writers do
+    // not starve verification. Readers may run beside these independent reviews.
+    ready.sort((a, b) => Number(Boolean(b.result) || b.kind === 'conflict') - Number(Boolean(a.result) || a.kind === 'conflict'));
+    for (const task of ready) {
+      if (this.store.getMeta('control') !== 'running' || this.controlLeaseLost() || this.attemptBudgetExhausted()) break;
+      if (this.activeTasks.has(task.id)) continue;
+      const review = Boolean(task.result) || task.kind === 'conflict';
+      const counts = this.stageCounts();
+      if (review ? counts.reviewers >= this.config.reviewers : counts.workers >= this.config.workers) continue;
+      if (resourcesFor(task, review).cpu > this.config.cpuCapacity) {
+        this.store.updateTask(task.id, { state: 'blocked', feedback: 'Task CPU weight exceeds current capacity; Goal must replan or capacity must be raised.' });
+        continue;
+      }
+      if (!this.resources.reserve(task, review, this.config.cpuCapacity)) continue;
+      this.activeStages.set(task.id, review ? 'review' : 'worker');
+      const running = this.runTask(task).finally(() => {
+        this.resources.release(task.id);
+        this.activeStages.delete(task.id);
+        this.activeTasks.delete(task.id);
+      });
+      this.activeTasks.set(task.id, running);
+    }
+  }
+  recordIdle(ready) {
+    const counts = this.stageCounts();
+    const idle = Math.max(0, this.config.workers - counts.workers);
+    const tasks = this.store.tasks();
+    const reasons = [];
+    if (idle) {
+      if (this.store.getMeta('control') === 'paused') reasons.push('control_paused');
+      if (this.attemptBudgetExhausted()) reasons.push('attempt_budget');
+      if (!ready.some(task => task.kind === 'work' && !task.result && !this.activeTasks.has(task.id))) reasons.push('frontier_empty');
+      if (tasks.some(task => task.state === 'queued' && task.dependencies.some(id => this.store.task(id).state !== 'accepted'))) reasons.push('dependency_wait');
+      if (tasks.some(task => task.state === 'reviewing') || counts.reviewers) reasons.push('review_wait');
+      if (ready.some(task => !this.activeTasks.has(task.id) && !this.resources.canRun(task, Boolean(task.result) || task.kind === 'conflict', this.config.cpuCapacity))) reasons.push('resource_blocked');
+      if (this.refillPromise) reasons.push('refill_pending');
+      const frontier = this.frontierState();
+      if (frontier.phase === 'CLOSING') reasons.push(['exhausted', 'no_useful_work'].includes(frontier.reason)
+        ? 'exhausted_or_no_useful_work' : 'frontier_closing');
+      if (frontier.phase === 'EVALUATING') reasons.push('goal_evaluating');
+    }
+    const status = { idle_workers: idle, active: counts, reasons, phase: this.frontierState().phase };
+    if (JSON.stringify(status) !== JSON.stringify(this.lastIdle)) {
+      this.lastIdle = status;
+      this.store.setMeta('scheduler:idle', { ...status, at: now() });
+      this.store.event('scheduler.idle', status);
     }
   }
   async followups(task) {
@@ -652,24 +812,32 @@ export class Engine {
       evidenceSnapshot: evidence.snapshot, currentFactIDs: new Set(Object.entries(evidence.facts).filter(([, current]) => current).map(([id]) => Number(id))) };
   }
   queueGoalTasks(candidates, round, reason) {
+    // Validate the complete proposal before creating any tasks. A bad later
+    // resource claim must not persist a partially admitted Goal plan.
+    const proposalIdentities = new Set();
+    for (const [index, candidate] of candidates.slice(0, this.config.maxTasks).entries()) {
+      validateTaskClaims(candidate, this.config.cpuCapacity);
+      if (candidate.depends_on.some(dependency => dependency < 0 || dependency >= index)) throw new Error('Goal dependencies must reference earlier proposal indexes.');
+      const identity = hash(`${candidate.title}\n${candidate.brief}\n${candidate.scope}`.normalize('NFKC').replace(/\s+/gu, ' ').trim().toLowerCase());
+      if (proposalIdentities.has(identity)) throw new Error('Duplicate Goal task.');
+      proposalIdentities.add(identity);
+    }
     const scheduled = [];
     const ids = [];
-    const seen = new Set();
     const terminal = new Set(['stalled', 'rejected', 'blocked', 'cancelled']);
-    for (const [index, candidate] of candidates.slice(0, this.config.maxTasks).entries()) {
-      if (!candidate.title.trim() || !candidate.brief.trim() || !candidate.scope.trim()) throw new Error('목표 후속 작업의 제목/지시/범위가 비어 있습니다.');
-      if (candidate.depends_on.some(dependency => dependency < 0 || dependency >= index)) throw new Error('목표 후속 작업은 앞선 작업만 선행 작업으로 참조할 수 있습니다.');
-      const identity = hash(`${candidate.title}\n${candidate.brief}\n${candidate.scope}`.normalize('NFKC').replace(/\s+/gu, ' ').trim().toLowerCase());
-      if (seen.has(identity)) throw new Error('목표 후속 작업에 중복이 있습니다.');
-      seen.add(identity);
+    for (const candidate of candidates.slice(0, this.config.maxTasks)) {
       const dependencies = candidate.depends_on.map(dependency => ids[dependency]);
       if (dependencies.some(dependency => !Number.isSafeInteger(dependency))) {
         ids.push(null);
         this.store.event('goal.task_skipped', { round, title: candidate.title, reason: 'excluded_dependency' });
         continue;
       }
-      const brief = { title: candidate.title, brief: candidate.brief, scope: candidate.scope };
-      const same = this.store.tasks().filter(task => task.title === candidate.title && task.brief === candidate.brief && task.scope === candidate.scope).at(-1);
+      const brief = { title: candidate.title, brief: candidate.brief, scope: candidate.scope,
+        ...(candidate.resources ? { resources: candidate.resources } : {}), ...(candidate.logical_key ? { logical_key: candidate.logical_key } : {}) };
+      const existing = this.store.existingTask(brief);
+      const same = existing ? this.store.task(existing) : this.store.tasks().filter(task =>
+        task.title === candidate.title && task.brief === candidate.brief && task.scope === candidate.scope).at(-1);
+      if (same && candidate.logical_key) this.store.aliasTask(candidate.logical_key, same.id);
       if (same?.state === 'accepted') { ids.push(same.id); continue; }
       if (same && terminal.has(same.state) && JSON.stringify(same.dependencies) === JSON.stringify(dependencies)) {
         ids.push(null);
@@ -1144,6 +1312,10 @@ export class Engine {
     return { kind: 'checkpoint', assessment, assessmentStatus: 'evaluated', terminationReason, candidate };
   }
   async assessGoal() {
+    if (this.activeTasks.size || this.refillPromise || this.resources.held.size) throw new Error('Goal requires a drained frontier and released workspace reservations.');
+    if (this.frontierState().phase === 'RUNNING') this.frontierPhase('CLOSING', 'stable_frontier');
+    this.frontierPhase('EVALUATING', 'stable_frontier');
+    this.recordIdle([]);
     let contract;
     try { contract = this.validateStoredContract(this.store.getMeta('goal:contract'), this.goalSource()); }
     catch (error) {
@@ -1224,6 +1396,7 @@ export class Engine {
     }
     const progress = this.progressState(assessment);
     const scheduled = this.queueGoalTasks(result.next_tasks, round, result.reason);
+    if (scheduled.length) this.frontierPhase('RUNNING', 'goal_targeted_work', true);
     if (this.noProgressLimitReached(progress)) {
       if (scheduled.length) this.store.event('goal.replan_tasks_preserved', { round, tasks: scheduled });
       const checkpointCandidate = scheduled.length ? this.completionCandidate(this.goalContext(), contract) : candidate;
@@ -1459,6 +1632,9 @@ export class Engine {
     return null;
   }
   async run() {
+    // Do this before recovering task state: a dead controller does not prove
+    // that its independently spawned provider has stopped using the workspace.
+    this.resources.recover();
     const source = sourceIdentity(this.config.workspace);
     const expected = this.store.getMeta('source:current', this.manifest.source);
     if (source.path !== expected.path) throw new Error('자료 폴더 경로가 바뀌었습니다. 올바른 workspace로 다시 실행하세요.');
@@ -1497,6 +1673,11 @@ export class Engine {
       if (candidate) this.store.setMeta('goal:candidate', { ...candidate, control_epoch: claimedEpoch });
     });
     this.store.recover();
+    if (this.store.getMeta('frontier:request')) {
+      this.store.event('frontier.interrupted', { request: this.store.getMeta('frontier:request').id });
+      this.store.setMeta('frontier:request', null);
+    }
+    if (this.frontierState().phase === 'EVALUATING') this.frontierPhase('CLOSING', 'assessment_interrupted');
     const pendingTerminal = this.pendingTerminalOutcome();
     if (pendingTerminal && this.terminalLimitStillApplies(pendingTerminal)) {
       const resumed = await this.resumeTerminalReport(pendingTerminal, 'report.resume_pending');
@@ -1601,7 +1782,20 @@ export class Engine {
       this.queueConflicts();
       while (!this.abortController.signal.aborted) {
         await this.poll();
-        if (this.store.getMeta('control') === 'paused') { await sleep(200); continue; }
+        if (this.store.getMeta('control') === 'paused') {
+          this.recordIdle(this.store.readyTasks());
+          await sleep(200); continue;
+        }
+        if (!this.activeTasks.size && !this.refillPromise && this.resources.held.size) throw new Error('Workspace reservation remains held by an unconfirmed process. Resume after confirming it has stopped.');
+        if (!this.activeTasks.size && this.refillPromise) {
+          // A coordinator may outlive the worker that triggered it. Continue
+          // reviews and newly ready work; only Goal/maintenance must wait for
+          // its admission decision and stable snapshot.
+          const ready = this.store.readyTasks();
+          this.dispatch(ready);
+          this.recordIdle(ready);
+          await sleep(100); continue;
+        }
         if (!this.activeTasks.size && this.attemptBudgetExhausted()) {
           const reported = await this.continueAcrossSegment(await this.segmentBudgetOutcome(), 'segment_budget_exhausted');
           if (reported) return reported;
@@ -1618,11 +1812,13 @@ export class Engine {
         }
         if (!this.activeTasks.size && this.store.tasks().some(task => task.state === 'accepted')) await this.curate(false);
         const ready = this.store.readyTasks().filter(task => !this.activeTasks.has(task.id));
-        for (const task of ready) {
-          if (this.activeTasks.size >= this.config.workers) break;
-          const running = this.runTask(task).finally(() => this.activeTasks.delete(task.id));
-          this.activeTasks.set(task.id, running);
-        }
+        if (ready.length && this.frontierState().phase === 'EVALUATING') this.frontierPhase('CLOSING', 'new_required_work');
+        // Refill work that was already in flight at this scheduler pass. Let
+        // newly dispatched, immediately completed tasks settle before paying
+        // for another provider call and inevitably invalidating its snapshot.
+        this.maybeRefill(ready);
+        this.dispatch(ready);
+        this.recordIdle(ready);
         if (!this.activeTasks.size) {
           const waiting = this.store.tasks().filter(task => ['queued', 'reviewing', 'running'].includes(task.state));
           if (waiting.length) {
@@ -1634,6 +1830,7 @@ export class Engine {
           }
           await this.curate(true);
           if (this.store.readyTasks().length || this.store.getMeta('control') !== 'running') continue;
+          this.frontierPhase('CLOSING', this.frontierState().reason || 'frontier_empty');
           let outcome;
           try {
             if (!await this.honorStoredControlRetry('goal')) continue;
@@ -1687,7 +1884,7 @@ export class Engine {
         }
         await sleep(100);
       }
-      await Promise.allSettled(this.activeTasks.values());
+      await Promise.allSettled([...this.activeTasks.values(), this.refillPromise].filter(Boolean));
       this.store.commitStopped(null, { fence: false });
       this.store.event('run.stopped', { resume: this.directory });
       return 'stopped';
@@ -1695,11 +1892,13 @@ export class Engine {
       if (this.abortController.signal.aborted || this.store.getMeta('control') === 'stopped'
           || (this.store.getMeta('control:epoch', 0) || 0) !== this.controlEpoch) {
         this.abortController.abort();
-        await Promise.allSettled(this.activeTasks.values());
+        await Promise.allSettled([...this.activeTasks.values(), this.refillPromise].filter(Boolean));
         this.store.commitStopped(null, { fence: false });
         this.store.event('run.stopped', { resume: this.directory });
         return 'stopped';
       }
+      this.abortController.abort();
+      await Promise.allSettled([...this.activeTasks.values(), this.refillPromise].filter(Boolean));
       this.store.setMeta('state', 'failed');
       this.store.setMeta('run:termination', { reason: 'controller_error', at: now(), detail: error.message });
       this.setSegmentPhase('failed', { ended_at: now(), termination_reason: 'controller_error' });

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
+import { once } from 'node:events';
 import { CodexSession, ClaudeSession } from '../src/providers.mjs';
 import { Engine } from '../src/engine.mjs';
 import { sleep } from '../src/util.mjs';
@@ -68,4 +69,38 @@ test('switching providers does not forward an incompatible model or effort', t =
   assert.equal(engine.settings('worker').model, 'gpt-example');
   assert.equal(engine.settings('supervisor').model, null);
   assert.equal(engine.settings('supervisor').effort, 'auto');
+});
+
+test('a provider exit does not release reservations before its stdio close is confirmed', async t => {
+  const { workspace } = fixture(t);
+  const states = [];
+  const session = new CodexSession({ cwd: workspace, bin: binary,
+    onProcess: state => states.push(state) });
+  const open = session.open.bind(session);
+  let observedExit = false;
+  session.open = async () => {
+    const result = await open();
+    const child = session.protocol.child;
+    const emit = child.emit.bind(child);
+    // Deterministically model stdio closing after process exit, across platforms.
+    child.emit = (event, ...args) => {
+      if (event === 'close') { setTimeout(() => emit(event, ...args), 100); return true; }
+      return emit(event, ...args);
+    };
+    const close = session.protocol.close.bind(session.protocol);
+    session.protocol.close = async () => {
+      if (child.exitCode === null) await once(child, 'exit');
+      observedExit = true;
+      assert.deepEqual(states, ['running']);
+      await close();
+    };
+    return result;
+  };
+  let closed = false;
+  const running = session.run({ prompt: '[exit-before-close]', schema });
+  while (!session.protocol) await sleep(10);
+  session.protocol.child.once('close', () => { closed = true; });
+  assert.deepEqual(await running, { value: 'initial' });
+  assert(observedExit); assert(closed);
+  assert.deepEqual(states, ['running', 'stopped']);
 });

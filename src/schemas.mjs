@@ -9,7 +9,12 @@ const array = items => ({ type: 'array', items });
 const object = properties => ({ type: 'object', properties, required: Object.keys(properties), additionalProperties: false });
 const enumeration = values => ({ type: 'string', enum: values });
 export const taskSchema = object({ title: text, brief: text, scope: text });
+export const resourceSchema = object({ workspace: enumeration(['read', 'write']), cpu: { type: 'integer' } });
+// Optional for old saved plans and worker followups; omitted claims are writers.
+taskSchema.properties.logical_key = text;
+taskSchema.properties.resources = resourceSchema;
 export const plannedTaskSchema = object({ ...taskSchema.properties, depends_on: array({ type: 'integer' }) });
+plannedTaskSchema.required = ['title', 'brief', 'scope', 'depends_on'];
 const contractRequirementSchema = object({
   type: enumeration(['outcome', 'deliverable', 'constraint']),
   statement: text,
@@ -35,6 +40,12 @@ export const schemas = {
     missing_requirements: array(object({ statement: text, source_reference: text, reason: text })),
   }),
   planner: object({ summary: text, tasks: array(plannedTaskSchema) }),
+  refill: object({
+    status: enumeration(['READY', 'EXHAUSTED', 'DEFERRED']), summary: text,
+    tasks: array(object({ ...plannedTaskSchema.properties, existing_dependencies: array({ type: 'integer' }) })),
+    wake: object({ kind: enumeration(['none', 'task_settled', 'knowledge_changed', 'graph_changed', 'instruction_changed']),
+      task_ids: array({ type: 'integer' }) }),
+  }),
   worker: object({
     summary: text,
     artifacts: array(object({ path: text, content: text })),
@@ -67,6 +78,17 @@ export const schemas = {
   curator: object({ scope: text, summary: text, fact_ids: array({ type: 'integer' }) }),
   editor: object({ title: text, body: text, fact_ids: array({ type: 'integer' }) }),
 };
+
+// Native structured-output providers require every declared property. Local
+// validators keep optional additions compatible with old plans/submissions.
+export function outputSchema(schema) {
+  if (schema.type === 'object') return { ...schema,
+    required: Object.keys(schema.properties),
+    properties: Object.fromEntries(Object.entries(schema.properties).map(([key, value]) => [key, outputSchema(value)])),
+  };
+  if (schema.type === 'array') return { ...schema, items: outputSchema(schema.items) };
+  return schema;
+}
 
 // The CLI's schema enforcement is supplemented by validation at the write boundary.
 export function validate(value, schema, location = 'result') {

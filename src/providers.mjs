@@ -15,6 +15,9 @@ class JsonProcess {
     this.sequence = 0;
     this.stderr = '';
     this.child = spawnCLI(name, args, options);
+    this.closed = new Promise(resolve => this.child.once('close', resolve));
+    this.options = options;
+    options.onProcess?.('running', this.child.pid);
     this.child.on('error', onError);
     this.child.stdin.on('error', onError);
     this.child.stderr.setEncoding('utf8');
@@ -39,6 +42,7 @@ class JsonProcess {
       }
     });
     this.child.on('close', (code, signal) => {
+      options.onProcess?.('stopped', this.child.pid);
       const error = new Error(`${name} 프로세스 종료 (${code ?? signal}). ${this.stderr.trim()}`);
       for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error); }
       this.pending.clear();
@@ -58,12 +62,15 @@ class JsonProcess {
     for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(new Error('세션 종료')); }
     this.pending.clear();
     await stopChild(this.child);
+    // exitCode can be set before stdio has closed. Only the close event confirms
+    // this managed process has finished; never synthesize an earlier release.
+    await this.closed;
     this.lines.close();
   }
 }
 
 export class CodexSession {
-  constructor(options = {}) { this.options = options; this.done = false; }
+  constructor(options = {}) { this.options = options; this.done = false; this.managedProcess = true; }
   async open() {
     const args = ['app-server', '--listen', 'stdio://'];
     if (this.options.runDirectory) args.push(
@@ -156,6 +163,7 @@ export class CodexSession {
       this.done = true;
       signal?.removeEventListener('abort', abort);
       await this.protocol?.close();
+      if (!this.protocol) this.options.onProcess?.('stopped', null);
     }
   }
   async steer(text) {
@@ -166,7 +174,7 @@ export class CodexSession {
 }
 
 export class ClaudeSession {
-  constructor(options = {}) { this.options = options; this.done = false; this.sent = 0; this.received = 0; }
+  constructor(options = {}) { this.options = options; this.done = false; this.sent = 0; this.received = 0; this.managedProcess = true; }
   async run({ prompt, schema, sessionID, signal, readOnly = false, model, effort = 'auto', permissions = 'workspace' }) {
     const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--replay-user-messages', '--json-schema', JSON.stringify(schema), '--permission-prompts', 'none'];
     const fullAccess = permissions === 'yolo';
@@ -203,6 +211,7 @@ export class ClaudeSession {
       this.done = true;
       signal?.removeEventListener('abort', abort);
       await this.protocol?.close();
+      if (!this.protocol) this.options.onProcess?.('stopped', null);
     }
   }
   userMessage(text) {

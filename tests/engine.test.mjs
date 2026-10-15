@@ -13,8 +13,10 @@ test('scheduler honors concurrency and dependencies with independent reviewers',
   const seen = [];
   const factory = scriptedFactory(async message => {
     const { role, data } = message;
-    if (role === 'planner') return { summary: 'Three checks', tasks: [
-      { ...task('One'), depends_on: [] }, { ...task('Two'), depends_on: [] }, { ...task('Three'), depends_on: [0, 1] },
+    if (role === 'planner' && !data.context?.operation) return { summary: 'Three checks', tasks: [
+      { ...task('One'), resources: { workspace: 'read', cpu: 1 }, depends_on: [] },
+      { ...task('Two'), resources: { workspace: 'read', cpu: 1 }, depends_on: [] },
+      { ...task('Three'), resources: { workspace: 'read', cpu: 1 }, depends_on: [0, 1] },
     ] };
     if (role === 'worker') {
       running++; maximum = Math.max(maximum, running); seen.push('worker-' + data.task.id);
@@ -285,6 +287,12 @@ test('corrupt and semantically invalid saved plans are quarantined and regenerat
     { name: 'forward dependency', write: file => writeJSON(file, {
       summary: 'Invalid saved plan', tasks: [{ ...task('Invalid saved task'), depends_on: [0] }],
     }) },
+    { name: 'invalid resource weight', write: file => writeJSON(file, {
+      summary: 'Invalid saved resources', tasks: [{ ...task(), resources: { workspace: 'read', cpu: 0 }, depends_on: [] }],
+    }) },
+    { name: 'empty logical key', write: file => writeJSON(file, {
+      summary: 'Invalid saved key', tasks: [{ ...task(), logical_key: ' ', depends_on: [] }],
+    }) },
   ];
   for (const scenario of scenarios) await t.test(scenario.name, async t => {
     const env = fixture(t);
@@ -292,7 +300,7 @@ test('corrupt and semantically invalid saved plans are quarantined and regenerat
     scenario.write(planPath);
     let plannerCalls = 0;
     const engine = new Engine(env.run, { providerFactory: scriptedFactory(message => {
-      if (message.role === 'planner') plannerCalls++;
+      if (message.role === 'planner' && !message.data.context?.operation) plannerCalls++;
       if (message.role === 'worker') return workerResult(env.workspace);
       return defaultResult(message);
     }) }); env.dispose(() => engine.close());

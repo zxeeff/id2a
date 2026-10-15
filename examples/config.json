@@ -1,6 +1,10 @@
 {
   "provider": "codex",
   "workers": 2,
+  "reviewers": 1,
+  "cpuCapacity": 2,
+  "frontierTarget": 10,
+  "maxRefillsPerCycle": 4,
   "permissions": "yolo",
   "inputPolicy": "continue",
   "model": "gpt-5.6-sol",
